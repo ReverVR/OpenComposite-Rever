@@ -1,0 +1,22 @@
+LIBRARY vulkan-1
+EXPORTS
+  vkAllocateCommandBuffers
+  vkBeginCommandBuffer
+  vkCmdBlitImage
+  vkCmdCopyImage
+  vkCmdPipelineBarrier
+  vkCmdResolveImage
+  vkCreateCommandPool
+  vkCreateDevice
+  vkCreateInstance
+  vkDestroyCommandPool
+  vkDestroyDevice
+  vkDestroyInstance
+  vkEndCommandBuffer
+  vkEnumeratePhysicalDevices
+  vkFreeCommandBuffers
+  vkGetDeviceQueue
+  vkGetInstanceProcAddr
+  vkGetPhysicalDeviceProperties2
+  vkGetPhysicalDeviceQueueFamilyProperties
+  vkQueueSubmit

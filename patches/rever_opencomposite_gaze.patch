@@ -1,0 +1,71 @@
+diff --git a/DrvOpenXR/XrHMD.cpp b/DrvOpenXR/XrHMD.cpp
+--- a/DrvOpenXR/XrHMD.cpp	2026-10-28 15:56:01.264892500 +0100
++++ b/DrvOpenXR/XrHMD.cpp	2026-10-28 15:56:01.264892500 +0100
+@@ -10,6 +10,7 @@
+ #include "../OpenOVR/convert.h"
+ #include "generated/static_bases.gen.h"
+ #include <thread>
++#include <chrono>
+ #include <mutex>
+ 
+ void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
+diff --git a/OpenOVR/Reimpl/BaseSystem.cpp b/OpenOVR/Reimpl/BaseSystem.cpp
+--- a/OpenOVR/Reimpl/BaseSystem.cpp	2026-10-28 15:56:01.264892500 +0100
++++ b/OpenOVR/Reimpl/BaseSystem.cpp	2026-10-28 15:56:01.263375700 +0100
+@@ -892,14 +892,54 @@
+ 	return PollNextEventWithPose(eOrigin, pEvent, uncbVREvent, pTrackedDevicePose);
+ }
+ 
++// Rever VR: the eyes' gaze from Rever's runtime in this process (rever_xr_runtime.dll's rever_streamer_gaze_dirs, the
++// Steam Frame's eye tracking) for games that foveate around it, as Half-Life: Alyx (user, 2026-10-28: "El activar eso
++// ... nos dara un plus importante"). Without that runtime or a fresh gaze, no eye tracking as before.
++static bool ReverGazeDirs(float dirs[9])
++{
++#ifdef _WIN32
++	typedef uint32_t (*GazeDirsFn)(float*, uint32_t);
++	static GazeDirsFn gazeDirs = nullptr;
++	static bool looked = false;
++	if (!looked) {
++		looked = true;
++		const HMODULE runtime = GetModuleHandleW(L"rever_xr_runtime.dll");
++		gazeDirs = runtime ? (GazeDirsFn)GetProcAddress(runtime, "rever_streamer_gaze_dirs") : nullptr;
++		OOVR_LOGF("Rever eye tracking: %s", gazeDirs ? "from Rever's runtime" : "none (no Rever runtime with a gaze)");
++	}
++	return gazeDirs && gazeDirs(dirs, 9) == 9;
++#else
++	return false;
++#endif
++}
++
++// Where a direction lands in a projection's NDC (-1..1, +Y up), false when it is behind
++static bool ReverGazeNdc(const vr::HmdMatrix44_t& p, const float* dir, vr::HmdVector2_t* ndc)
++{
++	const float x = dir[0] * 10.f, y = dir[1] * 10.f, z = dir[2] * 10.f;
++	const float w = p.m[3][0] * x + p.m[3][1] * y + p.m[3][2] * z + p.m[3][3];
++	if (w <= 1e-4f || !ndc)
++		return false;
++	ndc->v[0] = (p.m[0][0] * x + p.m[0][1] * y + p.m[0][2] * z + p.m[0][3]) / w;
++	ndc->v[1] = (p.m[1][0] * x + p.m[1][1] * y + p.m[1][2] * z + p.m[1][3]) / w;
++	return true;
++}
++
+ bool BaseSystem::GetEyeTrackedFoveationCenter(vr::HmdVector2_t* pNdcLeft, vr::HmdVector2_t* pNdcRight)
+ {
+-	return false; // no eye tracking
++	float dirs[9];
++	if (!ReverGazeDirs(dirs))
++		return false; // no eye tracking
++	return ReverGazeNdc(GetProjectionMatrix(Eye_Left, 0.1f, 100.f), dirs + 3, pNdcLeft)
++	    && ReverGazeNdc(GetProjectionMatrix(Eye_Right, 0.1f, 100.f), dirs + 6, pNdcRight);
+ }
+ 
+ bool BaseSystem::GetEyeTrackedFoveationCenterForProjection(const vr::HmdMatrix44_t* pProjMat, vr::HmdVector2_t* pNdc)
+ {
+-	return false; // no eye tracking
++	float dirs[9];
++	if (!pProjMat || !ReverGazeDirs(dirs))
++		return false; // no eye tracking
++	return ReverGazeNdc(*pProjMat, dirs, pNdc); // a projection of the caller's own: the head's gaze
+ }
+ 
+ vr::EVRInitError BaseSystem::SetSDKVersion(uint32_t nVersionMajor, uint32_t nVersionMinor, uint32_t nVersionBuild)

@@ -1,0 +1,353 @@
+diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
+index e83a16a..e218500 100644
+--- a/OpenOVR/Compositor/compositor.h
++++ b/OpenOVR/Compositor/compositor.h
+@@ -33,6 +33,10 @@ public:
+ 	virtual XrSwapchain GetSwapChain() { return chain; };
+ 
+ 	virtual XrExtent2Di GetSrcSize() { return { static_cast<int32_t>(createInfo.width), static_cast<int32_t>(createInfo.height) }; }
++
++	// Rever VR: an overlay's raw RGBA8 pixels (IVROverlay::SetOverlayRaw, FNVVR's laser) into this compositor's own
++	// swapchain. False where the graphics API has no such path (the overlay is then not drawn).
++	virtual bool ReverCopyRaw(const void* pixels, uint32_t width, uint32_t height) { return false; }
+ 	/**
+ 	 * Loads and unloads some context required for submitting textures to LibOVR. LoadSubmitContext is
+ 	 *  called before calling either Invoke or ovr_CommitTextureSwapChain, and ResetSubmitContext after
+diff --git a/OpenOVR/Compositor/vkcompositor.cpp b/OpenOVR/Compositor/vkcompositor.cpp
+index 86d268b..9b7f493 100644
+--- a/OpenOVR/Compositor/vkcompositor.cpp
++++ b/OpenOVR/Compositor/vkcompositor.cpp
+@@ -88,6 +88,7 @@ VkCompositor::VkCompositor(const vr::Texture_t* initialTexture)
+ 
+ 	appDevice = tex->m_pDevice;
+ 	appQueue = tex->m_pQueue;
++	appPhysicalDevice = tex->m_pPhysicalDevice;
+ 
+ 	VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+ 	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+@@ -98,6 +99,138 @@ VkCompositor::~VkCompositor()
+ {
+ 	// destroying command pool also frees command buffers
+ 	vkDestroyCommandPool(appDevice, appCommandPool, nullptr);
++	if (rawBuffer)
++		vkDestroyBuffer(appDevice, rawBuffer, nullptr);
++	if (rawMemory)
++		vkFreeMemory(appDevice, rawMemory, nullptr);
++}
++
++// Rever VR: an overlay's raw RGBA8 pixels (gamma encoded, as OpenVR takes them) into an R8G8B8A8_SRGB swapchain of its
++// own size, through a host-visible staging buffer on the app's queue. Called while the app holds its queue (inside its
++// eye submission: FNVVR sets its laser's image outside DXVK's submission lock, so SetOverlayRaw only keeps the pixels).
++// The queue is waited on: it happens once per image.
++bool VkCompositor::ReverCopyRaw(const void* pixels, uint32_t width, uint32_t height)
++{
++	if (!pixels || !width || !height || !appPhysicalDevice)
++		return false;
++
++	if (!chain || createInfo.width != width || createInfo.height != height || createInfo.format != VK_FORMAT_R8G8B8A8_SRGB) {
++		if (chain)
++			xrDestroySwapchain(chain);
++		chain = XR_NULL_HANDLE;
++		if (!appCommandBuffers.empty())
++			vkFreeCommandBuffers(appDevice, appCommandPool, appCommandBuffers.size(), appCommandBuffers.data());
++		appCommandBuffers.clear();
++
++		createInfo = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
++		createInfo.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
++		createInfo.faceCount = 1;
++		createInfo.width = width;
++		createInfo.height = height;
++		createInfo.mipCount = 1;
++		createInfo.sampleCount = 1;
++		createInfo.arraySize = 1;
++		createInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
++		createInfoFormat = VK_FORMAT_R8G8B8A8_SRGB;
++		if (XR_FAILED(xrCreateSwapchain(xr_session.get(), &createInfo, &chain))) {
++			OOVR_LOG("Rever VR: no swapchain for a raw overlay image");
++			chain = XR_NULL_HANDLE;
++			return false;
++		}
++		uint32_t chainLength = 0;
++		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(chain, 0, &chainLength, nullptr));
++		swapchainImages.resize(chainLength);
++		for (XrSwapchainImageVulkanKHR& swapchainImage : swapchainImages)
++			swapchainImage.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
++		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(chain, swapchainImages.size(), &chainLength, (XrSwapchainImageBaseHeader*)swapchainImages.data()));
++		appCommandBuffers.resize(chainLength);
++		VkCommandBufferAllocateInfo bufInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++		bufInfo.commandPool = appCommandPool;
++		bufInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++		bufInfo.commandBufferCount = chainLength;
++		OOVR_FAILED_VK_ABORT(vkAllocateCommandBuffers(appDevice, &bufInfo, appCommandBuffers.data()));
++	}
++
++	const VkDeviceSize size = VkDeviceSize(width) * height * 4;
++	if (rawSize < size) {
++		if (rawBuffer)
++			vkDestroyBuffer(appDevice, rawBuffer, nullptr);
++		if (rawMemory)
++			vkFreeMemory(appDevice, rawMemory, nullptr);
++		rawBuffer = VK_NULL_HANDLE;
++		rawMemory = VK_NULL_HANDLE;
++		rawSize = 0;
++		VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++		bufferInfo.size = size;
++		bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++		if (vkCreateBuffer(appDevice, &bufferInfo, nullptr, &rawBuffer) != VK_SUCCESS)
++			return false;
++		VkMemoryRequirements needs;
++		vkGetBufferMemoryRequirements(appDevice, rawBuffer, &needs);
++		VkPhysicalDeviceMemoryProperties memory;
++		vkGetPhysicalDeviceMemoryProperties(appPhysicalDevice, &memory);
++		const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++		uint32_t type = UINT32_MAX;
++		for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
++			if ((needs.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & wanted) == wanted)
++				type = i;
++		}
++		VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++		allocInfo.allocationSize = needs.size;
++		allocInfo.memoryTypeIndex = type;
++		if (type == UINT32_MAX || vkAllocateMemory(appDevice, &allocInfo, nullptr, &rawMemory) != VK_SUCCESS
++		    || vkBindBufferMemory(appDevice, rawBuffer, rawMemory, 0) != VK_SUCCESS) {
++			OOVR_LOG("Rever VR: no host-visible memory for a raw overlay image");
++			return false;
++		}
++		rawSize = size;
++	}
++	void* mapped = nullptr;
++	if (vkMapMemory(appDevice, rawMemory, 0, size, 0, &mapped) != VK_SUCCESS)
++		return false;
++	memcpy(mapped, pixels, size_t(size));
++	vkUnmapMemory(appDevice, rawMemory);
++
++	XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
++	uint32_t currentIndex;
++	OOVR_FAILED_XR_ABORT(xrAcquireSwapchainImage(chain, &acquireInfo, &currentIndex));
++	XrSwapchainImageWaitInfo waitInfo{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
++	waitInfo.timeout = XR_INFINITE_DURATION;
++	OOVR_FAILED_XR_ABORT(xrWaitSwapchainImage(chain, &waitInfo));
++
++	const VkCommandBuffer commands = appCommandBuffers.at(currentIndex);
++	VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++	OOVR_FAILED_VK_ABORT(vkBeginCommandBuffer(commands, &beginInfo));
++	VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++	barrier.image = swapchainImages.at(currentIndex).image;
++	barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++	vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	VkBufferImageCopy region = {};
++	region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	region.imageExtent = { width, height, 1 };
++	vkCmdCopyBufferToImage(commands, rawBuffer, swapchainImages.at(currentIndex).image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++	barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++	barrier.dstAccessMask = 0;
++	vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	OOVR_FAILED_VK_ABORT(vkEndCommandBuffer(commands));
++	VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++	submitInfo.commandBufferCount = 1;
++	submitInfo.pCommandBuffers = &commands;
++	OOVR_FAILED_VK_ABORT(vkQueueSubmit(appQueue, 1, &submitInfo, VK_NULL_HANDLE));
++	vkQueueWaitIdle(appQueue); // the staging buffer is free again, and the image is in place before the frame
++
++	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
++	OOVR_FAILED_XR_ABORT(xrReleaseSwapchainImage(chain, &releaseInfo));
++	return true;
+ }
+ 
+ void VkCompositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, std::optional<XruEye>, vr::EVRSubmitFlags submitFlags)
+diff --git a/OpenOVR/Compositor/vkcompositor.h b/OpenOVR/Compositor/vkcompositor.h
+index 1355c44..d2ae8de 100644
+--- a/OpenOVR/Compositor/vkcompositor.h
++++ b/OpenOVR/Compositor/vkcompositor.h
+@@ -12,6 +12,8 @@ public:
+ 
+ 	void InvokeCubemap(const vr::Texture_t* textures) override;
+ 
++	bool ReverCopyRaw(const void* pixels, uint32_t width, uint32_t height) override;
++
+ private:
+ 	static bool CheckChainCompatible(const vr::VRVulkanTextureData_t& tex, const XrSwapchainCreateInfo& chainDesc, vr::EColorSpace colourSpace);
+ 
+@@ -23,4 +25,10 @@ private:
+ 	VkQueue appQueue = VK_NULL_HANDLE;
+ 	VkCommandPool appCommandPool = VK_NULL_HANDLE;
+ 	std::vector<VkCommandBuffer> appCommandBuffers{};
++
++	// Rever VR: ReverCopyRaw's staging buffer (host visible, in the app's VkDevice)
++	VkPhysicalDevice appPhysicalDevice = VK_NULL_HANDLE;
++	VkBuffer rawBuffer = VK_NULL_HANDLE;
++	VkDeviceMemory rawMemory = VK_NULL_HANDLE;
++	VkDeviceSize rawSize = 0;
+ };
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+index ca452d5..8d2ec16 100644
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -275,8 +275,10 @@ ovr_enum_t BaseCompositor::Submit(EVREye eye, const Texture_t* texture, const VR
+ 		// Turns out games (Beat Saber in particular) really do not like the session being restarted
+ 		// while they're in the middle of submitting a frame.
+ 		auto lock = xr_session.lock_shared();
+-		if (!textureNull)
++		if (!textureNull) {
++			BaseOverlay::ReverNoteTexture(texture); // Rever VR: SetOverlayRaw's device
+ 			BackendManager::Instance().StoreEyeTexture(eye, texture, bounds, submitFlags, isFirstEye);
++		}
+ 
+ 		if (leftEyeSubmitted && rightEyeSubmitted) {
+ 			if (!isNullRender)
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+index d27138a..5de1cb2 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -49,6 +49,11 @@ public:
+ 	ETrackingUniverseOrigin reverAbsoluteOrigin = TrackingUniverseStanding;
+ 	HmdMatrix34_t reverLastAbsolute = {}; // as the game gave it, before any anchoring
+ 	bool reverAnchorPending = false; // to be anchored to the headset (ReverAnchorToHead)
++	// Rever VR: an image from raw pixels (SetOverlayRaw, FNVVR's laser), uploaded at the next eye submission
++	bool reverRaw = false;
++	bool reverRawPending = false;
++	std::vector<uint8_t> reverRawPixels;
++	uint32_t reverRawWidth = 0, reverRawHeight = 0;
+ 	union {
+ 		struct {
+ 			HmdMatrix34_t offset;
+@@ -97,6 +102,18 @@ BaseOverlay::~BaseOverlay()
+ // eye height and facing the way it looks, held still in the world from then on; the origin itself is at the user's
+ // feet. Only with the headset tracked: Alien Isolation's intro places it as the session starts, when the head was
+ // still reported at the origin and the screen went to the feet again (2026-10-09).
++// Rever VR: the device of the last Vulkan texture the game handed over (SetOverlayRaw's upload)
++static vr::VRVulkanTextureData_t reverVulkan = {};
++static bool reverVulkanValid = false;
++
++void BaseOverlay::ReverNoteTexture(const vr::Texture_t* texture)
++{
++	if (texture && texture->eType == vr::TextureType_Vulkan && texture->handle) {
++		reverVulkan = *(const vr::VRVulkanTextureData_t*)texture->handle;
++		reverVulkanValid = true;
++	}
++}
++
+ static bool ReverAnchorToHead(MfMatrix4f& transform, const std::string& key)
+ {
+ 	XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
+@@ -155,8 +172,30 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 		if (kv.second) {
+ 			OverlayData& overlay = *kv.second;
+ 
++			// Rever VR: an image from raw pixels uploaded now, inside the game's eye submission (its queue is ours here)
++			if (overlay.reverRawPending && reverVulkanValid && sceneLayer) {
++				overlay.reverRawPending = false;
++				vr::Texture_t device = { &reverVulkan, vr::TextureType_Vulkan, vr::ColorSpace_Gamma };
++				std::shared_ptr<Compositor> compositor = overlay.compositor.lock();
++				if (!compositor) {
++					compositor = GetUnsafeBaseCompositor()->CreateCompositorAPI(&device);
++					overlay.compositor = std::weak_ptr(compositor);
++					((XrBackend*)BackendManager::Instance().GetBackendInstance())->RegisterOverlayCompositor(compositor);
++				}
++				compositor->LoadSubmitContext();
++				const bool copied = compositor->ReverCopyRaw(overlay.reverRawPixels.data(), overlay.reverRawWidth, overlay.reverRawHeight);
++				compositor->ResetSubmitContext();
++				if (copied) {
++					overlay.reverRaw = true;
++					overlay.layerQuad.subImage.swapchain = compositor->GetSwapChain();
++					overlay.layerQuad.subImage.imageArrayIndex = 0;
++					overlay.layerQuad.subImage.imageRect = { { 0, 0 }, { (int32_t)overlay.reverRawWidth, (int32_t)overlay.reverRawHeight } };
++					OOVR_LOGF("Rever VR: overlay '%s' raw image %ux%u drawn", overlay.key.c_str(), overlay.reverRawWidth, overlay.reverRawHeight);
++				}
++			}
++
+ 			// Skip hiddden overlays, and those without a valid texture (eg, after calling ClearOverlayTexture).
+-			if (!overlay.visible || overlay.texture.handle == nullptr)
++			if (!overlay.visible || (overlay.texture.handle == nullptr && !overlay.reverRaw))
+ 				continue;
+ 
+ 			// Quick hack to get around Boneworks creating overlays and setting them to an opacity of
+@@ -169,7 +208,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 			}
+ 
+ 			const XrRect2Di& srcSize = overlay.layerQuad.subImage.imageRect;
+-			if (srcSize.extent.height <= 8 && srcSize.extent.width <= 8) {
++			if (srcSize.extent.height <= 8 && srcSize.extent.width <= 8 && !overlay.reverRaw) {
+ 				// Hack for F1 22 which creates a low res texture to fade between scenes
+ 				// but ends up just leaving a black square that takes up half the screen.
+ 				continue;
+@@ -213,6 +252,10 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
+ 
+ 			overlay.layerQuad.size.width = overlay.widthMeters * scales[0];
+ 			overlay.layerQuad.size.height = overlay.widthMeters * scales[1] / aspect;
++			// Rever VR: the texel aspect (a texel's width over its height), as SteamVR draws it: FNVVR stretches its laser's
++			// 8x8 image along the beam with it
++			if (overlay.texelAspect > 0.0f)
++				overlay.layerQuad.size.height /= overlay.texelAspect;
+ 
+ 			// Finally, add it to the list of layers to be sent to LibOVR
+ 			overlay.layerQuad.pose = { { rotation.x, rotation.y, rotation.z, rotation.w },
+@@ -816,6 +859,9 @@ EVROverlayError BaseOverlay::SetOverlayTexture(VROverlayHandle_t ulOverlayHandle
+ {
+ 	USEH();
+ 	overlay->texture = *pTexture;
++	overlay->reverRaw = false; // a texture again: no longer the raw image
++	overlay->reverRawPending = false;
++	ReverNoteTexture(pTexture);
+ 
+ 	BackendManager::Instance().OnOverlayTexture(pTexture);
+ 
+@@ -855,13 +901,31 @@ EVROverlayError BaseOverlay::ClearOverlayTexture(VROverlayHandle_t ulOverlayHand
+ }
+ EVROverlayError BaseOverlay::SetOverlayRaw(VROverlayHandle_t ulOverlayHandle, void* pvBuffer, uint32_t unWidth, uint32_t unHeight, uint32_t unDepth)
+ {
+-	// Rever VR: accepted and not drawn instead of aborting the game (Fallout: New Vegas' FNVVR sets an overlay from raw
+-	// pixels, likely its laser pointer; the menu panel itself comes as a texture)
++	// Rever VR: Fallout: New Vegas' FNVVR draws its laser pointers from an 8x8 RGBA image (user, 2026-10-21: "ok, pues
++	// arreglalo"). The pixels are kept, premultiplied by their alpha (the quad blends with the source alpha), and uploaded
++	// at the next eye submission: the game sets them outside DXVK's submission lock, so its Vulkan queue is not ours here.
+ 	USEH();
++	if (!pvBuffer || !unWidth || !unHeight || (unDepth != 4 && unDepth != 3 && unDepth != 1))
++		return VROverlayError_InvalidParameter;
++	overlay->reverRawPixels.resize(size_t(unWidth) * unHeight * 4);
++	const uint8_t* in = (const uint8_t*)pvBuffer;
++	for (size_t i = 0; i < size_t(unWidth) * unHeight; i++) {
++		uint8_t* out = &overlay->reverRawPixels[i * 4];
++		const uint8_t* texel = in + i * unDepth;
++		const uint8_t a = unDepth == 4 ? texel[3] : 255;
++		for (int c = 0; c < 3; c++)
++			out[c] = uint8_t((unsigned(texel[unDepth == 1 ? 0 : c]) * a + 127) / 255);
++		out[3] = a;
++	}
++	overlay->reverRawWidth = unWidth;
++	overlay->reverRawHeight = unHeight;
++	overlay->reverRawPending = true;
++	overlay->texture = {};
++	overlay->layerQuad.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+ 	static bool logged = false;
+ 	if (!logged) {
+ 		logged = true;
+-		OOVR_LOGF("Rever VR: overlay '%s' raw image %ux%u (%u bytes per pixel) accepted, not drawn", overlay->key.c_str(), unWidth, unHeight, unDepth);
++		OOVR_LOGF("Rever VR: overlay '%s' raw image %ux%u (%u bytes per pixel) kept for the next frame", overlay->key.c_str(), unWidth, unHeight, unDepth);
+ 	}
+ 	return VROverlayError_None;
+ }
+diff --git a/OpenOVR/Reimpl/BaseOverlay.h b/OpenOVR/Reimpl/BaseOverlay.h
+index 422093f..93dc09d 100644
+--- a/OpenOVR/Reimpl/BaseOverlay.h
++++ b/OpenOVR/Reimpl/BaseOverlay.h
+@@ -197,6 +197,10 @@ public:
+ 	// Destructor, since we have a map of pointers
+ 	~BaseOverlay();
+ 
++	// Rever VR: the graphics device of the last texture the game handed over (its eyes or an overlay), which an
++	// overlay set from raw pixels (SetOverlayRaw) is uploaded with
++	static void ReverNoteTexture(const vr::Texture_t* texture);
++
+ 	// Builds the collection of layers to be submitted to LibOVR
+ 	int _BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompositionLayerBaseHeader const* const*& result);
+ 

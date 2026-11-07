@@ -1,0 +1,244 @@
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -400,6 +400,7 @@ void XrBackend::WaitForTrackingData()
+ 	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+ 	XrFrameState state{ XR_TYPE_FRAME_STATE };
+ 
++	reverLastWait = std::chrono::steady_clock::now();
+ 	CloseOpenFrame();
+ 
+ 	{
+@@ -933,6 +934,41 @@ void OpenComposite_Android_EventPoll()
+ }
+ #endif
+ 
++void XrBackend::ReverOverlayOnlyFrame()
++{
++	PumpEvents();
++	if (!sessionActive || !usingApplicationGraphicsAPI || renderingFrame || xrFrameOpen)
++		return;
++	if (std::chrono::steady_clock::now() - reverLastWait < std::chrono::milliseconds(200))
++		return;
++
++	static int frames = 0;
++	if (++frames == 1 || frames % 1000 == 0)
++		OOVR_LOGF("Rever VR: overlay-only frames while the game is outside its frame loop (%d so far)", frames);
++
++	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
++	XrFrameState state{ XR_TYPE_FRAME_STATE };
++	{
++		auto lock = xr_session.lock_shared();
++		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
++		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
++		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
++		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
++	}
++
++	XrCompositionLayerBaseHeader const* const* headers = nullptr;
++	int layer_count = 0;
++	if (BaseOverlay* overlay = GetUnsafeBaseOverlay())
++		layer_count = overlay->_BuildLayers(nullptr, headers);
++
++	XrFrameEndInfo info{ XR_TYPE_FRAME_END_INFO };
++	info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
++	info.displayTime = xr_gbl->nextPredictedFrameTime;
++	info.layers = headers;
++	info.layerCount = layer_count;
++	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
++}
++
+ bool XrBackend::IsGraphicsConfigured()
+ {
+ 	return usingApplicationGraphicsAPI;
+diff --git a/DrvOpenXR/XrBackend.h b/DrvOpenXR/XrBackend.h
+--- a/DrvOpenXR/XrBackend.h
++++ b/DrvOpenXR/XrBackend.h
+@@ -9,6 +9,7 @@
+ #include "XrController.h"
+ #include "XrHMD.h"
+ 
++#include <chrono>
+ #include <memory>
+ #include <vector>
+ #include <mutex>
+@@ -29,6 +30,10 @@ public:
+ 
+ 	XrSessionState GetSessionState();
+ 
++	// Rever VR: a frame with only the overlays when the game updates one outside its frame loop (Fallout: New Vegas'
++	// FNVVR shows the intro movie on its panel without WaitGetPoses; SteamVR keeps compositing overlays by itself)
++	void ReverOverlayOnlyFrame();
++
+ 	/**
+ 	 * Whether the session is active or not. This cannot be determined from just the session state, since
+ 	 * we're allowed to send frames after calling xrBeginSession but before the event comes through. Same
+@@ -114,6 +119,9 @@ private:
+ 	bool xrFrameOpen = false;
+ 	void CloseOpenFrame();
+ 
++	// Rever VR: when the game last waited for poses (ReverOverlayOnlyFrame only runs once it stopped)
++	std::chrono::steady_clock::time_point reverLastWait{};
++
+ 	// Were we supposed to start rendering a frame, but couldn't since we were on the
+ 	// early (pre switch to application graphics instance) OpenXR session?
+ 	bool deferredRenderingStart = false;
+diff --git a/DrvOpenXR/XrHMD.cpp b/DrvOpenXR/XrHMD.cpp
+--- a/DrvOpenXR/XrHMD.cpp
++++ b/DrvOpenXR/XrHMD.cpp
+@@ -10,6 +10,7 @@
+ #include "../OpenOVR/convert.h"
+ #include "generated/static_bases.gen.h"
+ #include <thread>
++#include <chrono>
+ #include <mutex>
+ 
+ void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
+diff --git a/OpenOVR/Reimpl/BaseCompositor.cpp b/OpenOVR/Reimpl/BaseCompositor.cpp
+--- a/OpenOVR/Reimpl/BaseCompositor.cpp
++++ b/OpenOVR/Reimpl/BaseCompositor.cpp
+@@ -353,7 +353,15 @@ float BaseCompositor::GetFrameTimeRemaining()
+ 
+ void BaseCompositor::GetCumulativeStats(OOVR_Compositor_CumulativeStats* pStats, uint32_t nStatsSizeInBytes)
+ {
+-	STUBBED();
++	// Rever VR: no counters under OpenXR; empty stats for this process instead of aborting the game (Fallout: New
++	// Vegas' FNVVR reads them for its frame statistics)
++	if (!pStats)
++		return;
++	memset(pStats, 0, std::min<size_t>(nStatsSizeInBytes, sizeof(*pStats)));
++#ifdef _WIN32
++	if (nStatsSizeInBytes >= sizeof(pStats->m_nPid))
++		pStats->m_nPid = GetCurrentProcessId();
++#endif
+ }
+ 
+ void BaseCompositor::FadeToColor(float fSeconds, float fRed, float fGreen, float fBlue, float fAlpha, bool bBackground)
+diff --git a/OpenOVR/Reimpl/BaseInput.h b/OpenOVR/Reimpl/BaseInput.h
+--- a/OpenOVR/Reimpl/BaseInput.h
++++ b/OpenOVR/Reimpl/BaseInput.h
+@@ -17,6 +17,11 @@
+ 
+ typedef std::array<vr::VRBoneTransform_t, 31> BoneArray;
+ typedef vr::EVRSkeletalTrackingLevel OOVR_EVRSkeletalTrackingLevel;
++// Rever VR: IVRInput_003 (OpenVR 1.0.15) declares its handle types inside its own namespace, so the stub generator
++// names them OOVR_*: they are the same 64-bit handles
++typedef vr::VRActionSetHandle_t OOVR_VRActionSetHandle_t;
++typedef vr::VRActionHandle_t OOVR_VRActionHandle_t;
++typedef vr::VRInputValueHandle_t OOVR_VRInputValueHandle_t;
+ 
+ enum OOVR_EVRSkeletalReferencePose {
+ 	VRSkeletalReferencePose_BindPose = 0,
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -836,6 +836,9 @@ EVROverlayError BaseOverlay::SetOverlayTexture(VROverlayHandle_t ulOverlayHandle
+ 
+ 	overlay->layerQuad.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+ 
++	// Rever VR: shown in the headset even while the game is outside its frame loop (FNVVR's intro movie)
++	((XrBackend*)BackendManager::Instance().GetBackendInstance())->ReverOverlayOnlyFrame();
++
+ 	return VROverlayError_None;
+ }
+ EVROverlayError BaseOverlay::ClearOverlayTexture(VROverlayHandle_t ulOverlayHandle)
+@@ -852,7 +855,15 @@ EVROverlayError BaseOverlay::ClearOverlayTexture(VROverlayHandle_t ulOverlayHand
+ }
+ EVROverlayError BaseOverlay::SetOverlayRaw(VROverlayHandle_t ulOverlayHandle, void* pvBuffer, uint32_t unWidth, uint32_t unHeight, uint32_t unDepth)
+ {
+-	STUBBED();
++	// Rever VR: accepted and not drawn instead of aborting the game (Fallout: New Vegas' FNVVR sets an overlay from raw
++	// pixels, likely its laser pointer; the menu panel itself comes as a texture)
++	USEH();
++	static bool logged = false;
++	if (!logged) {
++		logged = true;
++		OOVR_LOGF("Rever VR: overlay '%s' raw image %ux%u (%u bytes per pixel) accepted, not drawn", overlay->key.c_str(), unWidth, unHeight, unDepth);
++	}
++	return VROverlayError_None;
+ }
+ EVROverlayError BaseOverlay::SetOverlayFromFile(VROverlayHandle_t ulOverlayHandle, const char* pchFilePath)
+ {
+diff --git a/OpenOVR/Reimpl/CVRInput.cpp b/OpenOVR/Reimpl/CVRInput.cpp
+--- a/OpenOVR/Reimpl/CVRInput.cpp
++++ b/OpenOVR/Reimpl/CVRInput.cpp
+@@ -2,6 +2,7 @@
+ #define GENFILE
+ #include "BaseCommon.h"
+ 
++GEN_INTERFACE("Input", "003")  // Rever VR: OpenVR 1.0.15 (Fallout: New Vegas' FNVVR Reborn asks for it)
+ GEN_INTERFACE("Input", "004")
+ GEN_INTERFACE("Input", "005")
+ GEN_INTERFACE("Input", "006")
+@@ -25,3 +26,71 @@ vr::EVRInputError CVRInput_004::GetSkeletalActionData(vr::VRActionHandle_t actio
+ 	return base->GetSkeletalActionData(action, (OOVR_InputSkeletalActionData_t*)pActionData, unActionDataSize, ulRestrictToDevice);
+ }
+ 
++// Rever VR: IVRInput_003 (OpenVR 1.0.15) had no device filter on its action data and haptics (any device), and its
++// skeletal input was a different, short-lived API that no current runtime keeps: it reports no data.
++vr::EVRInputError CVRInput_003::GetDigitalActionData(vr::VRActionHandle_t action, vr::IVRInput_003::InputDigitalActionData_t* pActionData, uint32_t unActionDataSize)
++{
++	return base->GetDigitalActionData(action, (OOVR_InputDigitalActionData_t*)pActionData, unActionDataSize, vr::k_ulInvalidInputValueHandle);
++}
++
++vr::EVRInputError CVRInput_003::GetAnalogActionData(vr::VRActionHandle_t action, vr::IVRInput_003::InputAnalogActionData_t* pActionData, uint32_t unActionDataSize)
++{
++	return base->GetAnalogActionData(action, (OOVR_InputAnalogActionData_t*)pActionData, unActionDataSize, vr::k_ulInvalidInputValueHandle);
++}
++
++vr::EVRInputError CVRInput_003::GetPoseActionData(vr::VRActionHandle_t action, vr::ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, vr::IVRInput_003::InputPoseActionData_t* pActionData, uint32_t unActionDataSize)
++{
++	return base->GetPoseActionData(action, eOrigin, fPredictedSecondsFromNow, (OOVR_InputPoseActionData_t*)pActionData, unActionDataSize, vr::k_ulInvalidInputValueHandle);
++}
++
++vr::EVRInputError CVRInput_003::TriggerHapticVibrationAction(vr::VRActionHandle_t action, float fStartSecondsFromNow, float fDurationSeconds, float fFrequency, float fAmplitude)
++{
++	return base->TriggerHapticVibrationAction(action, fStartSecondsFromNow, fDurationSeconds, fFrequency, fAmplitude, vr::k_ulInvalidInputValueHandle);
++}
++
++vr::EVRInputError CVRInput_003::GetSkeletalActionData(vr::VRActionHandle_t, vr::IVRInput_003::EVRSkeletalTransformSpace, float, vr::IVRInput_003::InputSkeletonActionData_t*, uint32_t, vr::VRBoneTransform_t*, uint32_t)
++{
++	return vr::VRInputError_NoData;
++}
++
++vr::EVRInputError CVRInput_003::GetSkeletalActionDataCompressed(vr::VRActionHandle_t, vr::IVRInput_003::EVRSkeletalTransformSpace, float, void*, uint32_t, uint32_t* punRequiredCompressedSize)
++{
++	if (punRequiredCompressedSize)
++		*punRequiredCompressedSize = 0;
++	return vr::VRInputError_NoData;
++}
++
++vr::EVRInputError CVRInput_003::UncompressSkeletalActionData(void*, uint32_t, vr::IVRInput_003::EVRSkeletalTransformSpace*, vr::VRBoneTransform_t*, uint32_t)
++{
++	return vr::VRInputError_NoData;
++}
++
++// Rever VR: IVRInput_003's VRActiveActionSet_t is 24 bytes (no unPadding / nPriority, added in IVRInput_004): copied
++// into the current struct with priority 0 (Fallout: New Vegas, "sizeof(*pSets) == unSizeOfVRSelectedActionSet_t")
++static std::vector<OOVR_VRActiveActionSet_t> rever_sets_from_003(const vr::IVRInput_003::VRActiveActionSet_t* pSets, uint32_t unSetCount)
++{
++	std::vector<OOVR_VRActiveActionSet_t> sets(unSetCount);
++	for (uint32_t i = 0; i < unSetCount; i++) {
++		sets[i] = {};
++		sets[i].ulActionSet = pSets[i].ulActionSet;
++		sets[i].ulRestrictedToDevice = pSets[i].ulRestrictedToDevice;
++		sets[i].ulSecondaryActionSet = pSets[i].ulSecondaryActionSet;
++	}
++	return sets;
++}
++
++vr::EVRInputError CVRInput_003::UpdateActionState(vr::IVRInput_003::VRActiveActionSet_t* pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount)
++{
++	if (unSizeOfVRSelectedActionSet_t != sizeof(vr::IVRInput_003::VRActiveActionSet_t))
++		return vr::VRInputError_InvalidParam;
++	std::vector<OOVR_VRActiveActionSet_t> sets = rever_sets_from_003(pSets, unSetCount);
++	return base->UpdateActionState(sets.data(), sizeof(OOVR_VRActiveActionSet_t), unSetCount);
++}
++
++vr::EVRInputError CVRInput_003::ShowBindingsForActionSet(vr::IVRInput_003::VRActiveActionSet_t* pSets, uint32_t unSizeOfVRSelectedActionSet_t, uint32_t unSetCount, vr::IVRInput_003::VRInputValueHandle_t originToHighlight)
++{
++	if (unSizeOfVRSelectedActionSet_t != sizeof(vr::IVRInput_003::VRActiveActionSet_t))
++		return vr::VRInputError_InvalidParam;
++	std::vector<OOVR_VRActiveActionSet_t> sets = rever_sets_from_003(pSets, unSetCount);
++	return base->ShowBindingsForActionSet(sets.data(), sizeof(OOVR_VRActiveActionSet_t), unSetCount, originToHighlight);
++}

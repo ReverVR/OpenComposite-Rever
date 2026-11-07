@@ -1,0 +1,192 @@
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -449,6 +449,25 @@
+ 	}
+ }
+ 
++// Rever VR: which eye's last bounds left nothing to show, and a log line when an eye's bounds change (the first 200)
++static bool reverEyeBoundsEmpty[2] = { false, false };
++
++static void ReverNoteEyeBounds(vr::EVREye eye, const vr::VRTextureBounds_t* bounds, const XrRect2Di& rect)
++{
++	static vr::VRTextureBounds_t last[2] = { { -1, -1, -1, -1 }, { -1, -1, -1, -1 } };
++	static int logged = 0;
++	int index = eye == vr::Eye_Right ? 1 : 0;
++	reverEyeBoundsEmpty[index] = rect.extent.width <= 0 || rect.extent.height <= 0;
++	vr::VRTextureBounds_t now = bounds ? *bounds : vr::VRTextureBounds_t{ 0, 0, 1, 1 };
++	if (std::memcmp(&now, &last[index], sizeof(now)) == 0 || logged >= 200)
++		return;
++	last[index] = now;
++	++logged;
++	OOVR_LOGF("Rever VR: eye %d bounds u %f..%f v %f..%f -> rect %d,%d %dx%d%s", index, now.uMin, now.uMax, now.vMin,
++	    now.vMax, rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height,
++	    reverEyeBoundsEmpty[index] ? " (no scene)" : "");
++}
++
+ void XrBackend::StoreEyeTexture(
+     vr::EVREye eye,
+     const vr::Texture_t* texture,
+@@ -466,8 +485,10 @@
+ 	Compositor& comp = *compPtr;
+ 
+ 	// If the session is inactive, we may be unable to write to the surface
+-	if (sessionActive && renderingFrame)
++	if (sessionActive && renderingFrame) {
+ 		comp.Invoke(texture, bounds, layer.subImage, (XruEye)eye, submitFlags);
++		ReverNoteEyeBounds(eye, bounds, layer.subImage.imageRect);
++	}
+ 
+ 	submittedEyeTextures = true;
+ 
+@@ -533,6 +554,11 @@
+ 			if (layer.subImage.swapchain == XR_NULL_HANDLE)
+ 				app_layer = nullptr;
+ 		}
++		// Rever VR: an eye submitted with bounds that leave nothing (MotherVR in Alien Isolation's cinematics and
++		// menus) shows no scene, as SteamVR does: only the overlays (its cinema screen). A 0x0 rectangle is
++		// XR_ERROR_SWAPCHAIN_RECT_INVALID and the whole frame was refused (2026-10-08)
++		if (reverEyeBoundsEmpty[0] || reverEyeBoundsEmpty[1])
++			app_layer = nullptr;
+ 		submittedEyeTextures = false;
+ 	}
+ 
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -44,6 +44,11 @@
+ 
+ 	// Transform
+ 	VROverlayTransformType transformType = VROverlayTransform_Absolute;
++	// Rever VR: the tracking origin an absolute transform was given in (seated: at the head, not the floor)
++	bool reverSetAbsolute = false;
++	ETrackingUniverseOrigin reverAbsoluteOrigin = TrackingUniverseStanding;
++	HmdMatrix34_t reverLastAbsolute = {}; // as the game gave it, before any anchoring
++	bool reverAnchorPending = false; // to be anchored to the headset (ReverAnchorToHead)
+ 	union {
+ 		struct {
+ 			HmdMatrix34_t offset;
+@@ -88,6 +93,41 @@
+ 	}
+ }
+ 
++// Rever VR: moves a screen placed straight ahead of the seated origin to the same distance ahead of the headset, at
++// eye height and facing the way it looks, held still in the world from then on; the origin itself is at the user's
++// feet. Only with the headset tracked: Alien Isolation's intro places it as the session starts, when the head was
++// still reported at the origin and the screen went to the feet again (2026-10-09).
++static bool ReverAnchorToHead(MfMatrix4f& transform, const std::string& key)
++{
++	XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
++	XrSpace space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
++	const XrSpaceLocationFlags tracked = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
++	    | XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
++	if (!XR_SUCCEEDED(xrLocateSpace(xr_gbl->viewSpace, space, xr_gbl->GetBestTime(), &head)) || (head.locationFlags & tracked) != tracked)
++		return false;
++	glm::vec3 headPosition = X2G_v3f(head.pose.position);
++	if (glm::length(headPosition) < 0.05f)
++		return false;
++
++	glm::vec3 forward = X2G_quat(head.pose.orientation) * glm::vec3(0.0f, 0.0f, -1.0f);
++	float yaw = std::atan2(-forward.x, -forward.z);
++	glm::mat3 turn = glm::mat3(glm::rotate(glm::mat4(1.0f), yaw, glm::vec3(0.0f, 1.0f, 0.0f)));
++	// transform[row][column] holds OpenVR's rows; glm's matrices are column-major
++	glm::mat3 rotation;
++	for (int row = 0; row < 3; row++)
++		for (int column = 0; column < 3; column++)
++			rotation[column][row] = transform[row][column];
++	rotation = turn * rotation;
++	glm::vec3 position = headPosition + turn * glm::vec3(0.0f, 0.0f, transform[2][3]);
++	for (int row = 0; row < 3; row++) {
++		for (int column = 0; column < 3; column++)
++			transform[row][column] = rotation[column][row];
++		transform[row][3] = position[row];
++	}
++	OOVR_LOGF("Rever VR: overlay '%s' anchored to the headset at %f %f %f", key.c_str(), position.x, position.y, position.z);
++	return true;
++}
++
+ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompositionLayerBaseHeader const* const*& layers)
+ {
+ 	// Note that at least on MSVC, this shouldn't be doing any memory allocations
+@@ -140,12 +180,43 @@
+ 			// ... and use that to set the size of the overlay, as it will appear to the user
+ 			// Note we shouldn't do this when setting the texture, as the user may change the width of
+ 			//  the overlay without changing the texture.
+-			overlay.layerQuad.size.width = overlay.widthMeters * overlay.overlayTransform[0][0];
+-			overlay.layerQuad.size.height = overlay.widthMeters * overlay.overlayTransform[1][1] / aspect;
++			// Rever VR: the whole transform (rotation and scale, not just the position), and an overlay placed
++			// relative to the headset in the view space: MotherVR's cinema screen in Alien Isolation sat on the
++			// floor at the origin, flat (2026-10-08)
++			if (overlay.reverAnchorPending && overlay.transformType == VROverlayTransform_Absolute && ReverAnchorToHead(overlay.overlayTransform, overlay.key))
++				overlay.reverAnchorPending = false;
++			MfMatrix4f transform = overlay.overlayTransform;
++			overlay.layerQuad.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
++			// An absolute transform is in the space the game's poses come in, whatever origin it names: MotherVR
++			// places its loading screen ahead of the head pose it read (standing heights) but names the seated
++			// origin, and the seated space put it on the ceiling (2026-10-09). Its fixed screens are anchored to
++			// the headset in SetOverlayTransformAbsolute. Never placed: OpenComposite's default, a metre ahead,
++			// at eye height rather than on the floor.
++			// (and until the headset is tracked to anchor it)
++			if (overlay.transformType == VROverlayTransform_Absolute && (!overlay.reverSetAbsolute || overlay.reverAnchorPending))
++				overlay.layerQuad.space = xr_gbl->seatedSpace;
++			if (overlay.transformType == VROverlayTransform_TrackedDeviceRelative
++			    && overlay.transformData.deviceRelative.device == k_unTrackedDeviceIndex_Hmd) {
++				S2O_om44(overlay.transformData.deviceRelative.offset, transform);
++				overlay.layerQuad.space = xr_gbl->viewSpace;
++			}
++			// transform[row][column], as S2O_om44 copies OpenVR's rows
++			glm::vec3 axes[3];
++			float scales[3];
++			for (int column = 0; column < 3; column++) {
++				axes[column] = glm::vec3(transform[0][column], transform[1][column], transform[2][column]);
++				scales[column] = glm::length(axes[column]);
++				if (scales[column] > 0.0001f)
++					axes[column] /= scales[column];
++			}
++			glm::quat rotation = glm::quat_cast(glm::mat3(axes[0], axes[1], axes[2]));
++
++			overlay.layerQuad.size.width = overlay.widthMeters * scales[0];
++			overlay.layerQuad.size.height = overlay.widthMeters * scales[1] / aspect;
+ 
+ 			// Finally, add it to the list of layers to be sent to LibOVR
+-			overlay.layerQuad.pose = { { 0.f, 0.f, 0.f, 1.f },
+-				{ overlay.overlayTransform[0][3], overlay.overlayTransform[1][3], overlay.overlayTransform[2][3] } };
++			overlay.layerQuad.pose = { { rotation.x, rotation.y, rotation.z, rotation.w },
++				{ transform[0][3], transform[1][3], transform[2][3] } };
+ 
+ 			layerHeaders.push_back((XrCompositionLayerBaseHeader*)&overlay.layerQuad);
+ 		}
+@@ -531,9 +602,25 @@
+ 	//  subtract the floor position to match it. This shouldn't usually be an issue though, as I can't
+ 	//  imagine many apps will use a different origin for their overlays.
+ 
++	// Rever VR: the same placement again (MotherVR repeats it) keeps the screen where it was anchored
++	if (overlay->transformType == VROverlayTransform_Absolute && overlay->reverSetAbsolute
++	    && std::memcmp(&overlay->reverLastAbsolute, pmatTrackingOriginToOverlayTransform, sizeof(HmdMatrix34_t)) == 0)
++		return VROverlayError_None;
++	overlay->reverLastAbsolute = *pmatTrackingOriginToOverlayTransform;
++	if (overlay->transformType != VROverlayTransform_Absolute || !overlay->reverSetAbsolute || overlay->reverAbsoluteOrigin != eTrackingOrigin)
++		OOVR_LOGF("Rever VR: overlay '%s' absolute (origin %d), at %f %f %f", overlay->key.c_str(), (int)eTrackingOrigin,
++		    pmatTrackingOriginToOverlayTransform->m[0][3], pmatTrackingOriginToOverlayTransform->m[1][3], pmatTrackingOriginToOverlayTransform->m[2][3]);
++	overlay->reverSetAbsolute = true;
++	overlay->reverAbsoluteOrigin = eTrackingOrigin;
+ 	overlay->transformType = VROverlayTransform_Absolute;
+ 	S2O_om44(*pmatTrackingOriginToOverlayTransform, overlay->overlayTransform);
+ 
++	// Rever VR: a screen straight ahead of the seated origin (x and y zero: MotherVR's cinema screen in Alien
++	// Isolation's intro, 1.5 m ahead) is anchored to the headset, in _BuildLayers once it is tracked
++	const MfMatrix4f& transform = overlay->overlayTransform;
++	overlay->reverAnchorPending = eTrackingOrigin != TrackingUniverseStanding && std::fabs(transform[0][3]) < 0.0001f
++	    && std::fabs(transform[1][3]) < 0.0001f;
++
+ 	return VROverlayError_None;
+ }
+ EVROverlayError BaseOverlay::GetOverlayTransformAbsolute(VROverlayHandle_t ulOverlayHandle, ETrackingUniverseOrigin* peTrackingOrigin, HmdMatrix34_t* pmatTrackingOriginToOverlayTransform)
+@@ -551,6 +638,9 @@
+ {
+ 	USEH();
+ 
++	if (overlay->transformType != VROverlayTransform_TrackedDeviceRelative || overlay->transformData.deviceRelative.device != unTrackedDevice)
++		OOVR_LOGF("Rever VR: overlay '%s' relative to device %u, at %f %f %f", overlay->key.c_str(), unTrackedDevice,
++		    pmatTrackedDeviceToOverlayTransform->m[0][3], pmatTrackedDeviceToOverlayTransform->m[1][3], pmatTrackedDeviceToOverlayTransform->m[2][3]);
+ 	overlay->transformType = VROverlayTransform_TrackedDeviceRelative;
+ 	overlay->transformData.deviceRelative.device = unTrackedDevice;
+ 	overlay->transformData.deviceRelative.offset = *pmatTrackedDeviceToOverlayTransform;
