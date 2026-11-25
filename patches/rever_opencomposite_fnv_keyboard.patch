@@ -1,0 +1,27 @@
+diff --git a/OpenOVR/Reimpl/BaseOverlay.cpp b/OpenOVR/Reimpl/BaseOverlay.cpp
+--- a/OpenOVR/Reimpl/BaseOverlay.cpp
++++ b/OpenOVR/Reimpl/BaseOverlay.cpp
+@@ -1043,7 +1043,11 @@
+ EVROverlayError BaseOverlay::ShowKeyboard(EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags,
+     const char* pchDescription, uint32_t unCharMax, const char* pchExistingText, uint64_t uUserValue)
+ {
+-	STUBBED();
++	// Rever VR: the newer interfaces' keyboard (EKeyboardFlags instead of bUseMinimalMode) as the older one - the
++	// placeholder that answers KeyboardDone at once - instead of aborting (a New Vegas player, 2026-11-13: "Hit stubbed
++	// file ... BaseOverlay.cpp:1046 func ShowKeyboard", the game closed)
++	return ShowKeyboard(eInputMode, eLineInputMode, pchDescription, unCharMax, pchExistingText,
++	    (unFlags & 1u) != 0 /* KeyboardFlag_Minimal */, uUserValue);
+ }
+ EVROverlayError BaseOverlay::ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayHandle,
+     EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode,
+@@ -1063,7 +1067,9 @@
+     EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags, const char* pchDescription, uint32_t unCharMax,
+     const char* pchExistingText, uint64_t uUserValue)
+ {
+-	STUBBED();
++	// Rever VR: as ShowKeyboard above, the older interfaces' placeholder instead of aborting
++	return ShowKeyboardForOverlay(ulOverlayHandle, eInputMode, eLineInputMode, pchDescription, unCharMax, pchExistingText,
++	    (unFlags & 1u) != 0 /* KeyboardFlag_Minimal */, uUserValue);
+ }
+ uint32_t BaseOverlay::GetKeyboardText(char* pchText, uint32_t cchText)
+ {

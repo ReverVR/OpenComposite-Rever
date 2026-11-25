@@ -1,0 +1,393 @@
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -5,6 +5,7 @@
+ #define BASE_IMPL
+ #include "BaseInput.h"
+ #include "BaseMailbox.h" // Rever VR: ReverLoadingDismissPressed
++#include "ReverGestures.h" // Rever VR: finger gestures from the controllers' touch sensors (KB ALX-005)
+ #include <string>
+ 
+ #include <convert.h>
+@@ -2053,14 +2054,30 @@
+ 
+ 	const InteractionProfile* profile = dev->GetInteractionProfile();
+ 
++	// Rever VR (2026-11-20, KB ALX-005; ReverGestures.h): each hand's first answer is logged ("Rever VR gestures: ...")
++	const int reverHand = static_cast<int>(act->skeletalHand);
++	const std::string reverProfile = profile ? profile->GetPath() : std::string();
++
+ 	// HACK until we have hand tracking data source in monado, i'm hardcoding this here so games won't think the index is a proper hand.
+ 	if (profile && profile->GetPath() == "/interaction_profiles/valve/index_controller") {
+ 		*pSkeletalTrackingLevel = vr::VRSkeletalTracking_Partial;
++		rever_gestures::NoteLevel(reverHand, *pSkeletalTrackingLevel, reverProfile, false);
+ 		return vr::VRInputError_None;
+ 	}
+ 
+ 	if (dev->IsHandTrackingValid()) {
+ 		*pSkeletalTrackingLevel = vr::VRSkeletalTracking_Full;
++		rever_gestures::NoteLevel(reverHand, *pSkeletalTrackingLevel, reverProfile, false);
++		return vr::VRInputError_None;
++	}
++
++	// Rever VR: a controller that senses the fingers by touch (a trigger touch input on that hand: Oculus Touch - the
++	// Quest and the Steam Frame through Rever's runtime) reports its estimated finger skeleton as Partial, as SteamVR
++	// does, so the game takes it (Half-Life: Alyx's pointing, thumbs up, fist and open hand). REVER_OC_GESTURES=1 only;
++	// otherwise exactly as before.
++	if (rever_gestures::On() && rever_gestures::SensesFingers(profile, reverHand)) {
++		*pSkeletalTrackingLevel = vr::VRSkeletalTracking_Partial;
++		rever_gestures::NoteLevel(reverHand, *pSkeletalTrackingLevel, reverProfile, true);
+ 		return vr::VRInputError_None;
+ 	}
+ 
+@@ -2068,6 +2085,7 @@
+ 		std::optional<vr::EVRSkeletalTrackingLevel> level = profile->GetOpenVRTrackinglevel();
+ 		if (level.has_value()) {
+ 			*pSkeletalTrackingLevel = static_cast<vr::EVRSkeletalTrackingLevel>(level.value());
++			rever_gestures::NoteLevel(reverHand, *pSkeletalTrackingLevel, reverProfile, false);
+ 			return vr::VRInputError_None;
+ 		} else {
+ 			*pSkeletalTrackingLevel = vr::VRSkeletalTracking_Estimated;
+@@ -2076,6 +2094,7 @@
+ 		*pSkeletalTrackingLevel = vr::VRSkeletalTracking_Estimated;
+ 	}
+ 
++	rever_gestures::NoteLevel(reverHand, *pSkeletalTrackingLevel, reverProfile, false);
+ 	return vr::VRInputError_None;
+ }
+ EVRInputError BaseInput::GetSkeletalBoneData(VRActionHandle_t action, EVRSkeletalTransformSpace eTransformSpace,
+diff --git a/OpenOVR/Reimpl/BaseInput_Hand.cpp b/OpenOVR/Reimpl/BaseInput_Hand.cpp
+--- a/OpenOVR/Reimpl/BaseInput_Hand.cpp
++++ b/OpenOVR/Reimpl/BaseInput_Hand.cpp
+@@ -8,6 +8,7 @@
+ #include <glm/gtx/quaternion.hpp>
+ #define BASE_IMPL
+ #include "BaseInput.h"
++#include "ReverGestures.h" // Rever VR: finger gestures from the controllers' touch sensors (KB ALX-005)
+ 
+ #include <convert.h>
+ 
+@@ -433,6 +434,11 @@
+ 
+ 	auto state = GetInterpolatedControllerState(hand, controller);
+ 
++	// Rever VR (KB ALX-005): what the game reads, and each hand's first pointing / thumbs up / fist / open hand, logged once
++	rever_gestures::NoteBones(static_cast<int>(hand), static_cast<int>(eMotionRange), static_cast<int>(transformSpace));
++	rever_gestures::NoteGesture(static_cast<int>(hand),
++	    rever_gestures::CurlsOf(state.triggerPct, state.gripPct, state.thumbTouchPct, state.triggerTouchPct));
++
+ 	auto boneDataGen = [state](const BoneArray& openPose, const BoneArray& closedPose) {
+ 		return std::ranges::iota_view(0, static_cast<int>(eBone_Count)) | std::views::transform([=](int bone_index) {
+ 			auto bone = openPose[bone_index];
+@@ -512,6 +518,7 @@
+ 	LegacyControllerActions& controller = legacyControllers[hand];
+ 
+ 	auto state = GetInterpolatedControllerState(hand, controller);
++	rever_gestures::NoteSummary(static_cast<int>(hand)); // Rever VR (KB ALX-005): logged once per hand
+ 
+ 	// Replicate what getEstimatedBoneData is doing
+ 
+diff --git a/OpenOVR/Reimpl/ReverGestures.h b/OpenOVR/Reimpl/ReverGestures.h
+new file mode 100644
+--- /dev/null
++++ b/OpenOVR/Reimpl/ReverGestures.h
+@@ -0,0 +1,180 @@
++// Rever VR - finger gestures in OpenVR games from the controllers' touch sensors (2026-11-20; user: "tenemos que activar
++// en nuestra capa de openxr los gestos en los juegos, en Alyx estan desactivados"; KB ALX-005).
++//
++// Without XR_EXT_hand_tracking (Rever's OpenXR runtime has none), OpenComposite already estimates each hand's skeleton
++// from the controller (BaseInput_Hand.cpp getEstimatedBoneData: the index from the trigger's touch and pull, the thumb
++// from any thumb touch, the other three fingers from the grip). But it reports that skeleton as
++// VRSkeletalTracking_Estimated for Oculus Touch controllers - what SteamVR says of a Vive wand, which senses no finger -
++// and a game may then keep its own canned hands (Half-Life: Alyx closes them with HandCurl / TriggerPull and never
++// points, raises the thumb or opens the hand). SteamVR, and Rever's own SteamVR driver (server_openvr alvr_server.cpp:
++// Partial for its controllers, the hands built from the same touches), report Partial for controllers that sense the
++// fingers by touch. With the switch on, a profile with a trigger touch input on that hand (Oculus Touch - the Quest and
++// the Steam Frame through Rever's runtime - and Index) answers Partial, and the game takes the estimated finger skeleton.
++//
++// Switch: REVER_OC_GESTURES=1 in the game's environment (Rever's app writes it into rever_session_env.json, for
++// Half-Life: Alyx by default; REVER_ALYX_GESTURES=0 in the app = not written). Anything else: the levels exactly as
++// before. The log lines ("Rever VR gestures: ...", each once) say what the game asked, what it got and the first time
++// each hand made each gesture.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++namespace rever_gestures {
++
++constexpr const char* kSwitch = "REVER_OC_GESTURES";
++
++/// REVER_OC_GESTURES=1 in the process's environment (read once, logged once).
++inline bool On()
++{
++	static const bool on = [] {
++		char value[16] = {};
++#ifdef _WIN32
++		const DWORD n = GetEnvironmentVariableA(kSwitch, value, sizeof(value));
++		const bool set = n > 0 && n < sizeof(value);
++#else
++		const char* env = std::getenv(kSwitch);
++		const bool set = env != nullptr && std::strlen(env) < sizeof(value);
++		if (set)
++			std::strcpy(value, env);
++#endif
++		const bool result = set && std::strcmp(value, "1") == 0;
++		if (result) {
++			OOVR_LOGF("Rever VR gestures: on (%s=1): touch-sensing controllers report their estimated finger skeleton as "
++			          "Partial",
++			    kSwitch);
++		} else {
++			OOVR_LOGF("Rever VR gestures: off (%s=%s): skeletal levels as before", kSwitch, set ? value : "unset");
++		}
++		return result;
++	}();
++	return on;
++}
++
++/// True the first time `bit` is seen (thread-safe, process-wide).
++inline bool First(uint32_t bit)
++{
++	static std::atomic<uint32_t> seen{ 0 };
++	return (seen.fetch_or(bit) & bit) == 0;
++}
++
++inline const char* HandName(int hand)
++{
++	return hand == 0 ? "left" : hand == 1 ? "right" : "other";
++}
++
++inline const char* LevelName(int level)
++{
++	switch (level) {
++	case 0:
++		return "Estimated";
++	case 1:
++		return "Partial";
++	case 2:
++		return "Full";
++	default:
++		return "?";
++	}
++}
++
++/// The controller senses the fingers by touch on that hand: its profile has a trigger touch input there.
++template <class Profile>
++inline bool SensesFingers(const Profile* profile, int hand)
++{
++	if (!profile || (hand != 0 && hand != 1))
++		return false;
++	const std::string path = std::string(hand == 0 ? "/user/hand/left" : "/user/hand/right") + "/input/trigger/touch";
++	return profile->IsInputPathValid(path);
++}
++
++// once-only bits: 0-1 level asked (per hand), 2-3 bones read, 4-5 summary read, 8.. gestures (5 per hand)
++inline void NoteLevel(int hand, int level, const std::string& profile, bool raised)
++{
++	if (hand < 0 || hand > 1 || !First(1u << hand))
++		return;
++	On(); // the switch's line first
++	OOVR_LOGF("Rever VR gestures: the game asks the %s hand's skeletal level: %s%s (%s)", HandName(hand), LevelName(level),
++	    raised ? " - finger curls from the controller's touch sensors" : "", profile.empty() ? "no profile" : profile.c_str());
++}
++
++inline void NoteBones(int hand, int range, int space)
++{
++	if (hand < 0 || hand > 1 || !First(1u << (2 + hand)))
++		return;
++	On();
++	OOVR_LOGF("Rever VR gestures: the game reads the %s hand's bones (estimated from the controller; motion range %s, "
++	          "%s space)",
++	    HandName(hand), range == 0 ? "with controller" : "without controller", space == 0 ? "model" : "parent");
++}
++
++inline void NoteSummary(int hand)
++{
++	if (hand < 0 || hand > 1 || !First(1u << (4 + hand)))
++		return;
++	On();
++	OOVR_LOGF("Rever VR gestures: the game reads the %s hand's finger curls (skeletal summary, estimated)", HandName(hand));
++}
++
++/// The finger curls the estimated bones carry (BaseInput_Hand.cpp's interpolations composed): thumb, index, the rest.
++struct Curls {
++	float thumb, index, middle, ring, pinky;
++};
++
++inline Curls CurlsOf(float trigger, float grip, float thumbTouch, float triggerTouch)
++{
++	auto compose = [](float a, float b) { return 1.0f - (1.0f - a) * (1.0f - b); };
++	const bool indexMoves = triggerTouch != 0.0f || trigger != 0.0f;
++	return Curls{
++		thumbTouch,
++		compose(indexMoves ? 0.4f * triggerTouch : 0.0f, trigger),
++		compose(indexMoves ? 0.2f * triggerTouch : 0.0f, grip),
++		compose(indexMoves ? 0.1f * triggerTouch : 0.0f, grip),
++		grip,
++	};
++}
++
++/// The gesture a hand makes now (nullptr: none of the five), from the curls.
++inline const char* GestureOf(const Curls& c)
++{
++	const float rest = (c.middle + c.ring + c.pinky) / 3.0f;
++	const bool restClosed = rest >= 0.7f, restOpen = rest <= 0.2f;
++	const bool indexClosed = c.index >= 0.7f, indexOpen = c.index <= 0.2f;
++	const bool thumbDown = c.thumb >= 0.7f, thumbUp = c.thumb <= 0.2f;
++	if (restOpen && indexOpen && thumbUp)
++		return "open hand";
++	if (restClosed && indexClosed && thumbDown)
++		return "fist";
++	if (restClosed && indexClosed && thumbUp)
++		return "thumbs up";
++	if (restClosed && indexOpen && thumbDown)
++		return "point";
++	if (restClosed && indexOpen && thumbUp)
++		return "finger gun";
++	return nullptr;
++}
++
++/// Logs the first time each hand makes each gesture (10 lines at most).
++inline void NoteGesture(int hand, const Curls& c)
++{
++	if (hand < 0 || hand > 1)
++		return;
++	const char* gesture = GestureOf(c);
++	if (!gesture)
++		return;
++	static const char* const kNames[] = { "open hand", "fist", "thumbs up", "point", "finger gun" };
++	for (uint32_t i = 0; i < 5; i++) {
++		if (std::strcmp(kNames[i], gesture) != 0)
++			continue;
++		if (First(1u << (8 + hand * 5 + i))) {
++			OOVR_LOGF("Rever VR gestures: %s hand, first '%s' (curls: thumb %.2f, index %.2f, middle %.2f, ring %.2f, "
++			          "pinky %.2f)",
++			    HandName(hand), gesture, c.thumb, c.index, c.middle, c.ring, c.pinky);
++		}
++		return;
++	}
++}
++
++} // namespace rever_gestures
+diff --git a/OpenOVR/Reimpl/ReverGesturesTest.cpp b/OpenOVR/Reimpl/ReverGesturesTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/OpenOVR/Reimpl/ReverGesturesTest.cpp
+@@ -0,0 +1,114 @@
++// Rever VR - desk test of ReverGestures.h (KB ALX-005), no game, no OpenXR: the switch, which profiles sense the
++// fingers, the curls the estimated bones carry and the gestures read from them, and the once-only log lines.
++// Build (x64 Native Tools): cl /nologo /std:c++20 /EHsc /W4 /DWIN32 ReverGesturesTest.cpp /Fe:rever_gestures_test.exe
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++#include <cmath>
++#include <cstdio>
++#include <set>
++#include <string>
++#include <vector>
++
++static std::vector<std::string> g_log;
++#define OOVR_LOGF(fmt, ...)                                         \
++	do {                                                            \
++		char line[512];                                             \
++		std::snprintf(line, sizeof(line), fmt, __VA_ARGS__);        \
++		g_log.emplace_back(line);                                   \
++	} while (0)
++
++#include "ReverGestures.h"
++
++static int g_failed = 0, g_passed = 0;
++#define CHECK(cond)                                                              \
++	do {                                                                         \
++		if (cond) {                                                              \
++			++g_passed;                                                          \
++		} else {                                                                 \
++			++g_failed;                                                          \
++			std::printf("FAIL line %d: %s\n", __LINE__, #cond);                  \
++		}                                                                        \
++	} while (0)
++
++struct FakeProfile {
++	std::set<std::string> paths;
++	bool IsInputPathValid(const std::string& path) const { return paths.count(path) != 0; }
++};
++
++static bool Near(float a, float b) { return std::fabs(a - b) < 1e-5f; }
++
++static size_t Count(const char* needle)
++{
++	size_t n = 0;
++	for (const auto& line : g_log)
++		n += line.find(needle) != std::string::npos;
++	return n;
++}
++
++int main()
++{
++	using namespace rever_gestures;
++
++	// the switch: REVER_OC_GESTURES=1 exactly (read once)
++	SetEnvironmentVariableA("REVER_OC_GESTURES", "1");
++	CHECK(On());
++	SetEnvironmentVariableA("REVER_OC_GESTURES", "0");
++	CHECK(On()); // read once: the session's value stays
++	CHECK(Count("Rever VR gestures: on (REVER_OC_GESTURES=1)") == 1);
++
++	// which controllers sense the fingers: a trigger touch input on that hand (OpenComposite's Touch and Index have it,
++	// Vive / WMR / simple do not)
++	FakeProfile touch{ { "/user/hand/left/input/trigger/touch", "/user/hand/right/input/trigger/touch" } };
++	FakeProfile wand{ { "/user/hand/left/input/trigger/value", "/user/hand/right/input/trigger/value" } };
++	CHECK(SensesFingers(&touch, 0) && SensesFingers(&touch, 1));
++	CHECK(!SensesFingers(&wand, 0) && !SensesFingers(&wand, 1));
++	CHECK(!SensesFingers<FakeProfile>(nullptr, 0) && !SensesFingers(&touch, 3));
++
++	// the curls the estimated bones carry: open, finger on the trigger, full pull, grip
++	Curls c = CurlsOf(0, 0, 0, 0);
++	CHECK(Near(c.thumb, 0) && Near(c.index, 0) && Near(c.middle, 0) && Near(c.ring, 0) && Near(c.pinky, 0));
++	c = CurlsOf(0, 0, 0, 1);
++	CHECK(Near(c.index, 0.4f) && Near(c.middle, 0.2f) && Near(c.ring, 0.1f) && Near(c.pinky, 0));
++	c = CurlsOf(1, 0, 0, 1);
++	CHECK(Near(c.index, 1) && Near(c.middle, 0.2f));
++	c = CurlsOf(0.5f, 0, 0, 1); // 0.4 then half the rest
++	CHECK(Near(c.index, 0.7f));
++	c = CurlsOf(0, 1, 1, 0);
++	CHECK(Near(c.thumb, 1) && Near(c.index, 0) && Near(c.middle, 1) && Near(c.ring, 1) && Near(c.pinky, 1));
++
++	// the gestures
++	CHECK(std::string(GestureOf(CurlsOf(0, 0, 0, 0))) == "open hand");
++	CHECK(std::string(GestureOf(CurlsOf(1, 1, 1, 1))) == "fist");
++	CHECK(std::string(GestureOf(CurlsOf(1, 1, 0, 1))) == "thumbs up");
++	CHECK(std::string(GestureOf(CurlsOf(0, 1, 1, 0))) == "point");
++	CHECK(std::string(GestureOf(CurlsOf(0, 1, 0, 0))) == "finger gun");
++	CHECK(GestureOf(CurlsOf(0.5f, 0.5f, 0.5f, 1)) == nullptr); // half way: none
++
++	// the log lines, each once
++	NoteLevel(0, 1, "/interaction_profiles/oculus/touch_controller", true);
++	NoteLevel(0, 1, "/interaction_profiles/oculus/touch_controller", true);
++	NoteLevel(1, 0, "", false);
++	CHECK(Count("the game asks the left hand's skeletal level: Partial - finger curls") == 1);
++	CHECK(Count("the game asks the right hand's skeletal level: Estimated (no profile)") == 1);
++	NoteBones(0, 0, 1);
++	NoteBones(0, 0, 1);
++	CHECK(Count("the game reads the left hand's bones (estimated from the controller; motion range with controller, "
++	            "parent space)") == 1);
++	NoteSummary(1);
++	NoteSummary(1);
++	CHECK(Count("the game reads the right hand's finger curls") == 1);
++	for (int frame = 0; frame < 3; frame++) {
++		NoteGesture(0, CurlsOf(0, 1, 1, 0)); // pointing, three frames
++		NoteGesture(1, CurlsOf(1, 1, 0, 1)); // thumbs up
++	}
++	NoteGesture(0, CurlsOf(0.5f, 0.5f, 0.5f, 1)); // none
++	NoteGesture(5, CurlsOf(0, 0, 0, 0)); // no such hand
++	CHECK(Count("left hand, first 'point'") == 1 && Count("right hand, first 'thumbs up'") == 1);
++	CHECK(Count("first '") == 2);
++
++	for (const auto& line : g_log)
++		std::printf("  log: %s\n", line.c_str());
++	std::printf("%d/%d passed\n", g_passed, g_passed + g_failed);
++	return g_failed == 0 ? 0 : 1;
++}

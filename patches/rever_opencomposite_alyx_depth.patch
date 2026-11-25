@@ -1,0 +1,2268 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 17fd03e..b205fd7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -219,6 +219,10 @@ add_library(DrvOpenXR STATIC
+ 	DrvOpenXR/XrBackend.cpp
+ 	DrvOpenXR/XrBackend.h
+ 
++	# Rever VR: Half-Life: Alyx's depth for Rever's layer (D3D11 only; empty elsewhere)
++	DrvOpenXR/ReverGameDepth.cpp
++	DrvOpenXR/ReverGameDepth.h
++
+ 	DrvOpenXR/XrTrackedDevice.cpp
+ 	DrvOpenXR/XrTrackedDevice.h
+ 
+diff --git a/DrvOpenXR/ReverGameDepth.cpp b/DrvOpenXR/ReverGameDepth.cpp
+new file mode 100644
+index 0000000..9a6a983
+--- /dev/null
++++ b/DrvOpenXR/ReverGameDepth.cpp
+@@ -0,0 +1,954 @@
++// Rever VR (GPL-3.0, Rever's OpenComposite), 2026-11-19 - Half-Life: Alyx's own depth for Rever's DLSS / FSR (KB ALX-002,
++// step 2; user: "si").
++//
++// With +vr_depth_submit 1 +vr_enable_depth_resolve 1 on its launch line, Alyx submits each eye with
++// Submit_TextureWithDepth (flags 0x218: pose, depth, motion with a null handle): its depth (D24S8, the eye at the same
++// bounds as the colour) and mProjection (its Z row remapped to 0.05..0.95). Here, on the game's own D3D11 device and
++// BEFORE OpenComposite copies the eye (Compositor::Invoke releases the eye's swapchain image, and that release is where
++// rever_xr_nr upscales it), a compute pass writes the channel rever_xr_nr's srinputs reads - Local\ReverVR_DLSS_SR_Inputs,
++// version 1, as rever_vk_depth's producer does for Batman and the Alien bridge's camera mode:
++// - per eye an R32_FLOAT depth, inverted with an infinite far plane (near_ref / view distance; 0 for the sky; flags 1),
++//   cropped to the eye and of the size the layer sees (the projection view's imageRect extent, checked every frame);
++// - per eye R16G16_FLOAT motion vectors of the camera: each pixel at its distance, from this frame's eye pose into the
++//   previous frame's (the OpenXR views OpenComposite hands down for each frame - the poses Alyx renders with), through
++//   the previous frame's projection; render pixels, pointing to where the point was (rever_xr_nr's MotionPS
++//   convention). The sky carries the rotation only. What moves on its own comes from the layer's optical flow on top
++//   (srgameflow);
++// - both textures shared by name (Local\ReverVR_SR_<pid>_<generation>_<eye>D / M) with keyed mutexes: taken with key 0
++//   (the layer gave them back) or key 1 (it never took the last ones), released with key 1; then the eye's jitter phase
++//   (0: Alyx does not jitter) and its sequence one up. A key the reader holds skips the frame: the game never waits.
++// A cut (the first frame, a new size, OpenVR's discontinuity flag 0x20, a pose jump, a gap over 250 ms) hands zero motion
++// for that frame. REVER_ALYX_GAME_DEPTH=1 (Rever's session file) arms it; anything else: nothing at all.
++#ifdef _WIN32
++
++#ifndef REVER_GAME_DEPTH_STANDALONE
++#include "XrBackend.h"
++
++#include "../OpenOVR/Misc/Config.h"
++#endif
++
++#include "ReverGameDepth.h"
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++
++#include <d3d11_1.h>
++#include <d3dcompiler.h>
++#include <dxgi1_2.h>
++
++#include <cmath>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++#pragma comment(lib, "d3dcompiler.lib")
++
++namespace rever_game_depth {
++namespace {
++
++// rever_xr_nr's SrInputsBlock (layer.cpp), version 1 - the only one the sealed layer opens
++struct SrInputsBlock {
++	uint32_t magic; // "RVSI", written last
++	uint32_t version;
++	uint32_t pid; // the textures' names
++	volatile LONG generation; // a new one whenever the textures are made again
++	uint32_t width, height; // the eye's size: the layer takes nothing of another size
++	uint32_t flags; // 1: depth inverted (1 near, 0 far)
++	uint32_t reserved;
++	struct Eye {
++		volatile LONG seq;
++		uint32_t phase; // the jitter phase rendered with (0: none)
++		uint32_t reserved[2];
++	} eyes[2];
++};
++static_assert(sizeof(SrInputsBlock) == 64, "rever_xr_nr's layout");
++constexpr uint32_t kMagic = 0x49535652; // "RVSI"
++constexpr uint32_t kFlagInverted = 1;
++// rever_xr_nr's names: the block, and the textures' "Local\ReverVR_SR_<pid>_<generation>_<eye><D|M>". Only the desk test
++// (built apart, REVER_GAME_DEPTH_STANDALONE) can use others, so it never touches a running game's channel.
++#ifdef REVER_GAME_DEPTH_STANDALONE
++const wchar_t* g_blockName = L"Local\\ReverVR_DLSS_SR_Inputs";
++const wchar_t* g_texturePrefix = L"Local\\ReverVR_SR_";
++#else
++constexpr const wchar_t* g_blockName = L"Local\\ReverVR_DLSS_SR_Inputs";
++constexpr const wchar_t* g_texturePrefix = L"Local\\ReverVR_SR_";
++#endif
++
++constexpr uint64_t kGapMs = 250; // longer between two frames of an eye: a cut
++constexpr float kJumpMetres = 0.5f; // the eye moved more in one frame: a cut (recentre, tracking lost)
++constexpr float kJumpDegrees = 45.f;
++constexpr int kSourceViews = 4; // the game's depth textures kept viewed (one per texture it submits)
++
++// the shader's cbuffer, 16-byte rows
++struct Constants {
++	int32_t origin[2]; // the eye's rectangle in the game's depth texture
++	int32_t last[2]; // the game's depth texture's last pixel
++	float size[2]; // the eye as the layer sees it
++	float stepSize[2]; // depth pixels per output pixel
++	float tanNow[4]; // left, right, up, down tangents of the game's projection now
++	float tanThen[4]; // the same, the frame before
++	float row0[4], row1[4], row2[4]; // xyz: a view direction now into the previous view; w: the eye's move there (m)
++	float k, m22, nearRef; // inverted depth = saturate(k * (raw + m22)); view distance = nearRef / inverted
++	uint32_t mode; // 1: no previous frame (zero motion); 2: a multisampled depth (its sample 0)
++};
++static_assert(sizeof(Constants) == 128, "the shader's cbuffer");
++
++const char kShader[] = R"(
++Texture2D<float> depthTex : register(t0);
++Texture2DMS<float> depthMs : register(t1);
++RWTexture2D<float> outDepth : register(u0);
++RWTexture2D<float2> outMotion : register(u1);
++cbuffer Eye : register(b0) {
++    int2 origin; int2 last; float2 size; float2 stepSize;
++    float4 tanNow; float4 tanThen; float4 row0; float4 row1; float4 row2;
++    float k; float m22; float nearRef; uint mode;
++};
++[numthreads(8, 8, 1)]
++void CS(uint3 id : SV_DispatchThreadID) {
++    if (id.x >= (uint)size.x || id.y >= (uint)size.y) return;
++    int2 at = clamp(origin + int2((float2(id.xy) + 0.5) * stepSize), int2(0, 0), last);
++    float raw = (mode & 2u) != 0u ? depthMs.Load(at, 0) : depthTex.Load(int3(at, 0));
++    float inverted = saturate(k * (raw + m22));
++    outDepth[id.xy] = inverted;
++    float2 motion = float2(0, 0);
++    if ((mode & 1u) == 0u) {
++        float2 uv = (float2(id.xy) + 0.5) / size;
++        float3 now = float3(lerp(tanNow.x, tanNow.y, uv.x), lerp(tanNow.z, tanNow.w, uv.y), -1.0);
++        float3 before = float3(dot(row0.xyz, now), dot(row1.xyz, now), dot(row2.xyz, now));
++        if (inverted > 1e-7) before = before * (nearRef / inverted) + float3(row0.w, row1.w, row2.w);
++        if (before.z < -1e-4) {
++            float2 t = before.xy / -before.z;
++            float2 uvBefore = float2((t.x - tanThen.x) / (tanThen.y - tanThen.x), (t.y - tanThen.z) / (tanThen.w - tanThen.z));
++            motion = (uvBefore - uv) * size;
++        }
++    }
++    outMotion[id.xy] = motion;
++}
++)";
++
++struct Output {
++	ID3D11Texture2D* texture = nullptr;
++	ID3D11UnorderedAccessView* uav = nullptr;
++	IDXGIKeyedMutex* mutex = nullptr;
++	HANDLE handle = nullptr; // the name lives as long as it is open
++};
++
++struct SourceView {
++	ID3D11Texture2D* texture = nullptr; // identity only: the view holds it
++	ID3D11ShaderResourceView* srv = nullptr;
++	bool multisampled = false;
++	uint32_t width = 0, height = 0;
++	uint64_t used = 0;
++};
++
++struct History {
++	bool valid = false;
++	Pose pose;
++	float tangents[4] = {};
++	uint64_t atMs = 0;
++};
++
++struct Projection {
++	float tangents[4] = {}; // left, right, up, down
++	float k = 0, m22 = 0, nearRef = 0;
++};
++
++struct State {
++	bool switchRead = false, armed = false, broken = false;
++	ID3D11Device* device = nullptr;
++	ID3D11DeviceContext* context = nullptr;
++	ID3D11ComputeShader* shader = nullptr;
++	ID3D11Buffer* constants = nullptr;
++	HANDLE blockMap = nullptr;
++	SrInputsBlock* block = nullptr;
++	Output depth[2], motion[2];
++	uint32_t width = 0, height = 0;
++	LONG generation = 0;
++	SourceView sources[kSourceViews];
++	uint64_t sourceClock = 0, sourceViewsMade = 0;
++	History history[2];
++	Stats total;
++	// this second's
++	uint64_t windowStart = 0, wProduced = 0, wBusy = 0, wSize = 0, wOther = 0, wResets = 0;
++	float wGapMax = -1.f;
++	// said once
++	bool saidFirst[2] = {}, saidNoDepth = false, saidSize = false, saidProjection = false, saidFormat = false, saidFlip = false,
++	     saidRange = false;
++};
++State g;
++void (*g_sink)(const char*) = nullptr;
++
++template <typename T>
++void SafeRelease(T*& p)
++{
++	if (p)
++		p->Release();
++	p = nullptr;
++}
++
++void Say(const char* format, ...)
++{
++	char text[1024];
++	va_list args;
++	va_start(args, format);
++	vsnprintf(text, sizeof(text), format, args);
++	va_end(args);
++	char line[1100];
++	snprintf(line, sizeof(line), "Rever VR game depth: %s", text);
++	if (g_sink)
++		g_sink(line);
++#ifdef REVER_GAME_DEPTH_STANDALONE
++	else {
++		fputs(line, stdout);
++		fputc('\n', stdout);
++	}
++#else
++	OOVR_LOG(line);
++#endif
++}
++
++bool Fail(const char* what, HRESULT hr)
++{
++	Say("%s (0x%08lx): off for this session", what, (unsigned long)hr);
++	g.broken = true;
++	g.total.broken = true;
++	return false;
++}
++
++void ReleaseOutputs()
++{
++	Output* groups[2] = { g.depth, g.motion };
++	for (Output* group : groups)
++		for (int e = 0; e < 2; ++e) {
++			Output& o = group[e];
++			SafeRelease(o.uav);
++			SafeRelease(o.mutex);
++			SafeRelease(o.texture);
++			if (o.handle)
++				CloseHandle(o.handle);
++			o = Output{};
++		}
++	g.width = g.height = 0;
++}
++
++void ReleaseSources()
++{
++	for (SourceView& s : g.sources) {
++		SafeRelease(s.srv);
++		s = SourceView{};
++	}
++}
++
++// what was made on the game's device (the block stays: the same process, a new generation)
++void DropDevice()
++{
++	ReleaseOutputs();
++	ReleaseSources();
++	SafeRelease(g.shader);
++	SafeRelease(g.constants);
++	SafeRelease(g.context);
++	SafeRelease(g.device);
++	g.history[0].valid = g.history[1].valid = false;
++	if (g.block) {
++		g.block->width = g.block->height = 0;
++		MemoryBarrier();
++	}
++}
++
++bool EnsureBlock()
++{
++	if (g.block)
++		return true;
++	g.blockMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SrInputsBlock), g_blockName);
++	if (!g.blockMap)
++		return Fail("Local\\ReverVR_DLSS_SR_Inputs not made", HRESULT_FROM_WIN32(GetLastError()));
++	g.block = static_cast<SrInputsBlock*>(MapViewOfFile(g.blockMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SrInputsBlock)));
++	if (!g.block)
++		return Fail("Local\\ReverVR_DLSS_SR_Inputs not mapped", HRESULT_FROM_WIN32(GetLastError()));
++	std::memset(g.block, 0, sizeof(SrInputsBlock));
++	g.block->version = 1;
++	g.block->pid = GetCurrentProcessId();
++	g.block->flags = kFlagInverted;
++	MemoryBarrier();
++	g.block->magic = kMagic; // last: a reader checks it
++	return true;
++}
++
++bool Init(ID3D11Device* device)
++{
++	g.device = device;
++	g.device->AddRef();
++	g.device->GetImmediateContext(&g.context);
++	const D3D_FEATURE_LEVEL level = g.device->GetFeatureLevel();
++	if (level < D3D_FEATURE_LEVEL_11_0)
++		return Fail("the game's D3D11 device is below feature level 11_0", E_NOTIMPL);
++	ID3DBlob* code = nullptr;
++	ID3DBlob* errors = nullptr;
++	HRESULT hr = D3DCompile(kShader, sizeof(kShader) - 1, "rever_game_depth", nullptr, nullptr, "CS", "cs_5_0",
++	    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
++	if (FAILED(hr)) {
++		Say("the compute shader did not compile: %s", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
++		SafeRelease(errors);
++		return Fail("compute shader", hr);
++	}
++	SafeRelease(errors);
++	hr = g.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g.shader);
++	SafeRelease(code);
++	if (FAILED(hr))
++		return Fail("compute shader not made", hr);
++	D3D11_BUFFER_DESC cb{};
++	cb.ByteWidth = sizeof(Constants);
++	cb.Usage = D3D11_USAGE_DEFAULT;
++	cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++	hr = g.device->CreateBuffer(&cb, nullptr, &g.constants);
++	if (FAILED(hr))
++		return Fail("constant buffer not made", hr);
++	if (!EnsureBlock())
++		return false;
++	Say("ready on the game's D3D11 device (feature level %x): Local\\ReverVR_DLSS_SR_Inputs version 1, depth inverted, "
++	    "the camera's motion",
++	    (unsigned)level);
++	return true;
++}
++
++bool MakeOutput(Output& o, DXGI_FORMAT format, const wchar_t* name)
++{
++	D3D11_TEXTURE2D_DESC desc{};
++	desc.Width = g.width;
++	desc.Height = g.height;
++	desc.MipLevels = desc.ArraySize = 1;
++	desc.Format = format;
++	desc.SampleDesc.Count = 1;
++	desc.Usage = D3D11_USAGE_DEFAULT;
++	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
++	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
++	HRESULT hr = g.device->CreateTexture2D(&desc, nullptr, &o.texture);
++	if (FAILED(hr))
++		return Fail("a shared texture not made", hr);
++	IDXGIResource1* resource = nullptr;
++	hr = o.texture->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void**>(&resource));
++	if (SUCCEEDED(hr))
++		hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, name, &o.handle);
++	SafeRelease(resource);
++	if (SUCCEEDED(hr))
++		hr = o.texture->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&o.mutex));
++	if (SUCCEEDED(hr))
++		hr = g.device->CreateUnorderedAccessView(o.texture, nullptr, &o.uav);
++	if (FAILED(hr)) {
++		Say("%ls not shared", name);
++		return Fail("a shared texture not named", hr);
++	}
++	return true;
++}
++
++bool EnsureOutputs(uint32_t width, uint32_t height)
++{
++	if (g.width == width && g.height == height && g.depth[0].texture)
++		return true;
++	ReleaseOutputs();
++	g.width = width;
++	g.height = height;
++	static LONG generations = 0; // unique in the process: rever_xr_nr may still hold an older name open
++	const LONG next = InterlockedIncrement(&generations);
++	const unsigned pid = unsigned(GetCurrentProcessId());
++	for (int e = 0; e < 2; ++e) {
++		wchar_t name[128];
++		swprintf_s(name, L"%s%u_%ld_%dD", g_texturePrefix, pid, next, e);
++		if (!MakeOutput(g.depth[e], DXGI_FORMAT_R32_FLOAT, name)) {
++			ReleaseOutputs();
++			return false;
++		}
++		swprintf_s(name, L"%s%u_%ld_%dM", g_texturePrefix, pid, next, e);
++		if (!MakeOutput(g.motion[e], DXGI_FORMAT_R16G16_FLOAT, name)) {
++			ReleaseOutputs();
++			return false;
++		}
++	}
++	g.width = width;
++	g.height = height;
++	g.generation = next;
++	g.block->width = width;
++	g.block->height = height;
++	MemoryBarrier();
++	InterlockedExchange(&g.block->generation, next);
++	g.history[0].valid = g.history[1].valid = false;
++	Say("depth and motion textures %ux%u per eye ready (generation %ld)", width, height, next);
++	return true;
++}
++
++// The game's depth texture viewed for the pass (R24G8 as R24_UNORM_X8 and the other depth formats likewise); null when it
++// cannot be read.
++SourceView* Source(ID3D11Texture2D* texture)
++{
++	++g.sourceClock;
++	SourceView* slot = nullptr;
++	for (SourceView& s : g.sources) {
++		if (s.texture == texture && s.srv) {
++			s.used = g.sourceClock;
++			return &s;
++		}
++		if (!slot || !s.srv || (slot->srv && s.used < slot->used))
++			slot = &s;
++	}
++	D3D11_TEXTURE2D_DESC d{};
++	texture->GetDesc(&d);
++	DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
++	switch (d.Format) {
++	case DXGI_FORMAT_R24G8_TYPELESS:
++	case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
++		view = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++		break;
++	case DXGI_FORMAT_R32_TYPELESS:
++	case DXGI_FORMAT_R32_FLOAT:
++		view = DXGI_FORMAT_R32_FLOAT;
++		break;
++	case DXGI_FORMAT_R32G8X24_TYPELESS:
++	case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
++		view = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
++		break;
++	case DXGI_FORMAT_R16_TYPELESS:
++	case DXGI_FORMAT_R16_UNORM:
++		view = DXGI_FORMAT_R16_UNORM;
++		break;
++	default:
++		break;
++	}
++	if (view == DXGI_FORMAT_UNKNOWN || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || d.ArraySize != 1) {
++		if (!g.saidFormat) {
++			g.saidFormat = true;
++			Say("the game's depth cannot be read (%ux%u DXGI format %d, bind 0x%x, array %u): nothing handed", d.Width,
++			    d.Height, int(d.Format), d.BindFlags, d.ArraySize);
++		}
++		return nullptr;
++	}
++	D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
++	sv.Format = view;
++	if (d.SampleDesc.Count > 1) {
++		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
++	} else {
++		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++		sv.Texture2D.MostDetailedMip = 0;
++		sv.Texture2D.MipLevels = 1;
++	}
++	ID3D11ShaderResourceView* srv = nullptr;
++	const HRESULT hr = g.device->CreateShaderResourceView(texture, &sv, &srv);
++	if (FAILED(hr)) {
++		if (!g.saidFormat) {
++			g.saidFormat = true;
++			Say("the game's depth not viewed (0x%08lx, DXGI format %d): nothing handed", (unsigned long)hr, int(d.Format));
++		}
++		return nullptr;
++	}
++	SafeRelease(slot->srv);
++	slot->texture = texture;
++	slot->srv = srv;
++	slot->multisampled = d.SampleDesc.Count > 1;
++	slot->width = d.Width;
++	slot->height = d.Height;
++	slot->used = g.sourceClock;
++	if (++g.sourceViewsMade <= 8)
++		Say("the game's depth: %ux%u DXGI format %d, %u samples, bind 0x%x (read as DXGI format %d)", d.Width, d.Height,
++		    int(d.Format), d.SampleDesc.Count, d.BindFlags, int(view));
++	return slot;
++}
++
++// OpenVR's projection (GetProjectionMatrix's shape): x' = P00 x + P02 z, y' = P11 y + P12 z, z' = P22 z + P23, w' = -z.
++bool ReadProjection(const float (&P)[4][4], Projection& out)
++{
++	const auto zero = [](float v) { return std::fabs(v) < 1e-5f; };
++	if (!(P[0][0] > 0) || !(P[1][1] > 0) || !zero(P[0][1]) || !zero(P[0][3]) || !zero(P[1][0]) || !zero(P[1][3])
++	    || !zero(P[2][0]) || !zero(P[2][1]) || !zero(P[3][0]) || !zero(P[3][1]) || !zero(P[3][3]) || std::fabs(P[3][2] + 1.f) > 1e-4f
++	    || zero(P[2][3]))
++		return false;
++	const double m00 = P[0][0], m02 = P[0][2], m11 = P[1][1], m12 = P[1][2], m22 = P[2][2], m23 = P[2][3];
++	out.tangents[0] = float((m02 - 1.0) / m00);
++	out.tangents[1] = float((m02 + 1.0) / m00);
++	out.tangents[2] = float((m12 + 1.0) / m11);
++	out.tangents[3] = float((m12 - 1.0) / m11);
++	// a raw depth z (0..1) lies at the view distance d = m23 / (z + m22); the nearest the buffer can hold is the reference
++	const double d0 = m22 != 0 ? m23 / m22 : -1.0, d1 = (1.0 + m22) != 0 ? m23 / (1.0 + m22) : -1.0;
++	double nearRef = -1.0;
++	if (d0 > 0)
++		nearRef = d0;
++	if (d1 > 0 && (nearRef < 0 || d1 < nearRef))
++		nearRef = d1;
++	if (!(nearRef > 0))
++		return false;
++	out.nearRef = float(nearRef);
++	out.m22 = float(m22);
++	out.k = float(nearRef / m23);
++	return true;
++}
++
++void QuatToMatrix(const float q[4], float m[3][3])
++{
++	const float x = q[0], y = q[1], z = q[2], w = q[3];
++	m[0][0] = 1 - 2 * (y * y + z * z);
++	m[0][1] = 2 * (x * y - z * w);
++	m[0][2] = 2 * (x * z + y * w);
++	m[1][0] = 2 * (x * y + z * w);
++	m[1][1] = 1 - 2 * (x * x + z * z);
++	m[1][2] = 2 * (y * z - x * w);
++	m[2][0] = 2 * (x * z - y * w);
++	m[2][1] = 2 * (y * z + x * w);
++	m[2][2] = 1 - 2 * (x * x + y * y);
++}
++
++// R = then^T * now (a view direction now into the previous view), T = then^T * (position now - position then)
++void Relative(const Pose& now, const Pose& then, float r[3][3], float t[3])
++{
++	float a[3][3], b[3][3];
++	QuatToMatrix(now.orientation, a);
++	QuatToMatrix(then.orientation, b);
++	const float d[3] = { now.position[0] - then.position[0], now.position[1] - then.position[1], now.position[2] - then.position[2] };
++	for (int i = 0; i < 3; ++i) {
++		for (int j = 0; j < 3; ++j)
++			r[i][j] = b[0][i] * a[0][j] + b[1][i] * a[1][j] + b[2][i] * a[2][j];
++		t[i] = b[0][i] * d[0] + b[1][i] * d[1] + b[2][i] * d[2];
++	}
++}
++
++float AngleDegrees(const float a[3][3], const float b[3][3])
++{
++	float trace = 0;
++	for (int i = 0; i < 3; ++i)
++		for (int j = 0; j < 3; ++j)
++			trace += a[j][i] * b[j][i];
++	const float c = (trace - 1.f) * 0.5f;
++	return std::acos(c > 1.f ? 1.f : (c < -1.f ? -1.f : c)) * 57.2957795f;
++}
++
++bool Take(IDXGIKeyedMutex* mutex, UINT& key)
++{
++	if (mutex->AcquireSync(0, 0) == S_OK) {
++		key = 0; // the layer gave it back
++		return true;
++	}
++	if (mutex->AcquireSync(1, 0) == S_OK) {
++		key = 1; // the layer never took the last one: written over
++		return true;
++	}
++	return false; // the reader holds it now: this frame is skipped, never waited for
++}
++
++void Tick(uint64_t now)
++{
++	if (!g.windowStart) {
++		g.windowStart = now;
++		return;
++	}
++	if (now - g.windowStart < 1000)
++		return;
++	if (g.wProduced || g.wBusy || g.wSize || g.wOther) {
++		char gap[64] = "";
++		if (g.wGapMax >= 0)
++			snprintf(gap, sizeof(gap), "; render pose vs OpenXR view %.2f deg max", g.wGapMax);
++		Say("%llu eyes produced, %llu skipped (keys busy %llu, size %llu, other %llu) in %.1f s; %ux%u per eye (generation "
++		    "%ld); resets %llu (%llu so far)%s",
++		    (unsigned long long)g.wProduced, (unsigned long long)(g.wBusy + g.wSize + g.wOther), (unsigned long long)g.wBusy,
++		    (unsigned long long)g.wSize, (unsigned long long)g.wOther, double(now - g.windowStart) / 1000.0, g.width, g.height,
++		    g.generation, (unsigned long long)g.wResets, (unsigned long long)g.total.resets, gap);
++	}
++	g.windowStart = now;
++	g.wProduced = g.wBusy = g.wSize = g.wOther = g.wResets = 0;
++	g.wGapMax = -1.f;
++}
++
++bool SkipOther(History& history)
++{
++	++g.total.otherSkips;
++	++g.wOther;
++	history.valid = false;
++	return false;
++}
++
++void Dispatch(int eye, const SourceView& source, const Constants& c)
++{
++	ID3D11DeviceContext* ctx = g.context;
++	// the game's compute state, given back as it was
++	ID3D11ComputeShader* oldShader = nullptr;
++	ID3D11ClassInstance* oldInstances[256] = {};
++	UINT oldInstanceCount = 256;
++	ctx->CSGetShader(&oldShader, oldInstances, &oldInstanceCount);
++	ID3D11ShaderResourceView* oldSrv[2] = {};
++	ctx->CSGetShaderResources(0, 2, oldSrv);
++	ID3D11UnorderedAccessView* oldUav[2] = {};
++	ctx->CSGetUnorderedAccessViews(0, 2, oldUav);
++	ID3D11Buffer* oldCb = nullptr;
++	ctx->CSGetConstantBuffers(0, 1, &oldCb);
++	// the game's depth still bound for writing (its depth-stencil view) would leave our view of it empty: unbound for the pass
++	ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
++	ID3D11DepthStencilView* dsv = nullptr;
++	ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
++	UINT rtvCount = 0;
++	for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
++		if (rtvs[i])
++			rtvCount = i + 1;
++	bool dsvMoved = false;
++	if (dsv) {
++		ID3D11Resource* bound = nullptr;
++		dsv->GetResource(&bound);
++		dsvMoved = bound == source.texture;
++		SafeRelease(bound);
++	}
++	if (dsvMoved)
++		ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtvCount, rtvs, nullptr, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
++
++	ctx->UpdateSubresource(g.constants, 0, nullptr, &c, 0, 0);
++	ID3D11ShaderResourceView* srvs[2] = { source.multisampled ? nullptr : source.srv, source.multisampled ? source.srv : nullptr };
++	ID3D11UnorderedAccessView* uavs[2] = { g.depth[eye].uav, g.motion[eye].uav };
++	ctx->CSSetShader(g.shader, nullptr, 0);
++	ctx->CSSetConstantBuffers(0, 1, &g.constants);
++	ctx->CSSetShaderResources(0, 2, srvs);
++	ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
++	ctx->Dispatch((g.width + 7) / 8, (g.height + 7) / 8, 1);
++
++	const UINT keepCounts[2] = { UINT(-1), UINT(-1) };
++	ctx->CSSetUnorderedAccessViews(0, 2, oldUav, keepCounts);
++	ctx->CSSetShaderResources(0, 2, oldSrv);
++	ctx->CSSetConstantBuffers(0, 1, &oldCb);
++	ctx->CSSetShader(oldShader, oldInstanceCount ? oldInstances : nullptr, oldInstanceCount);
++	if (dsvMoved)
++		ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtvCount, rtvs, dsv, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
++	SafeRelease(oldShader);
++	for (UINT i = 0; i < oldInstanceCount && i < 256; ++i)
++		SafeRelease(oldInstances[i]);
++	for (int i = 0; i < 2; ++i) {
++		SafeRelease(oldSrv[i]);
++		SafeRelease(oldUav[i]);
++	}
++	SafeRelease(oldCb);
++	for (ID3D11RenderTargetView*& rtv : rtvs)
++		SafeRelease(rtv);
++	SafeRelease(dsv);
++}
++
++} // namespace
++
++bool Armed()
++{
++	if (!g.switchRead) {
++		g.switchRead = true;
++		char value[16] = {};
++		const DWORD n = GetEnvironmentVariableA("REVER_ALYX_GAME_DEPTH", value, sizeof(value));
++		g.armed = n == 1 && value[0] == '1';
++		if (g.armed)
++			Say("on (REVER_ALYX_GAME_DEPTH=1): the game's depth and the camera's motion into Rever's layer (srinputs)");
++		else
++			Say("off (REVER_ALYX_GAME_DEPTH=%s): no producer", n > 0 && n < sizeof(value) ? value : "unset");
++	}
++	return g.armed;
++}
++
++bool ProduceEye(int eye, const EyeInput& in)
++{
++	if (!Armed() || g.broken || eye < 0 || eye > 1)
++		return false;
++	Tick(in.nowMs);
++	History& history = g.history[eye];
++	if (!in.depth) {
++		++g.total.noDepth;
++		history.valid = false;
++		if (!g.saidNoDepth) {
++			g.saidNoDepth = true;
++			Say("eye %d submitted without the game's depth (flags 0x%x): it needs +vr_depth_submit 1 +vr_enable_depth_resolve 1 on "
++			    "the launch line and no layer that clears the depth bit (the global ReShade)",
++			    eye, in.submitFlags);
++		}
++		return false;
++	}
++	ID3D11Device* device = nullptr;
++	in.depth->GetDevice(&device);
++	if (!device)
++		return SkipOther(history);
++	if (device != g.device) {
++		if (g.device) {
++			Say("the game's D3D11 device changed: everything made again");
++			DropDevice();
++		}
++		const bool ok = Init(device);
++		device->Release();
++		if (!ok)
++			return false;
++	} else {
++		device->Release();
++	}
++
++	Projection now;
++	if (!ReadProjection(in.projection, now)) {
++		if (!g.saidProjection) {
++			g.saidProjection = true;
++			const float(&P)[4][4] = in.projection;
++			Say("the game's projection is not OpenVR's usual shape [%g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g]: "
++			    "nothing handed",
++			    P[0][0], P[0][1], P[0][2], P[0][3], P[1][0], P[1][1], P[1][2], P[1][3], P[2][0], P[2][1], P[2][2], P[2][3],
++			    P[3][0], P[3][1], P[3][2], P[3][3]);
++		}
++		return SkipOther(history);
++	}
++	if (!g.saidRange && (in.vRange[0] != 0.f || in.vRange[1] != 1.f)) {
++		g.saidRange = true;
++		Say("the game's depth range is %g-%g (not used: the depth is read through mProjection)", in.vRange[0], in.vRange[1]);
++	}
++	if (in.bounds[0] > in.bounds[1] || in.bounds[2] > in.bounds[3]) {
++		if (!g.saidFlip) {
++			g.saidFlip = true;
++			Say("eye %d's bounds are flipped (u %.4f-%.4f v %.4f-%.4f): nothing handed", eye, in.bounds[0], in.bounds[1],
++			    in.bounds[2], in.bounds[3]);
++		}
++		return SkipOther(history);
++	}
++	if (in.width <= 0 || in.height <= 0)
++		return SkipOther(history);
++	if (eye == 0 || !g.depth[0].texture) {
++		if (!EnsureOutputs(uint32_t(in.width), uint32_t(in.height)))
++			return false;
++	} else if (uint32_t(in.width) != g.width || uint32_t(in.height) != g.height) {
++		// the block holds one size for both eyes and the layer refuses another: this eye goes without
++		++g.total.sizeSkips;
++		++g.wSize;
++		history.valid = false;
++		if (!g.saidSize) {
++			g.saidSize = true;
++			Say("eye 1 is %dx%d and eye 0 %ux%u: the layer takes one size, so eye 1 goes without the game's data", in.width,
++			    in.height, g.width, g.height);
++		}
++		return false;
++	}
++	SourceView* source = Source(in.depth);
++	if (!source)
++		return SkipOther(history);
++
++	// a cut: zero motion this frame
++	bool cut = !history.valid || (in.submitFlags & 0x20) != 0 || in.nowMs - history.atMs > kGapMs;
++	float r[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, t[3] = { 0, 0, 0 };
++	if (!cut) {
++		Relative(in.pose, history.pose, r, t);
++		static const float identity[3][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };
++		const float moved = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
++		if (moved > kJumpMetres || AngleDegrees(r, identity) > kJumpDegrees)
++			cut = true;
++	}
++	if (in.hasRenderRotation) { // diagnostics: the game's render pose against the OpenXR view used here
++		float view[3][3];
++		QuatToMatrix(in.pose.orientation, view);
++		const float gap = AngleDegrees(view, in.renderRotation);
++		if (gap > g.wGapMax)
++			g.wGapMax = gap;
++	}
++
++	Constants c{};
++	const float bw = in.bounds[1] - in.bounds[0], bh = in.bounds[3] - in.bounds[2];
++	c.origin[0] = int32_t(in.bounds[0] * float(source->width));
++	c.origin[1] = int32_t(in.bounds[2] * float(source->height));
++	c.last[0] = int32_t(source->width) - 1;
++	c.last[1] = int32_t(source->height) - 1;
++	c.size[0] = float(g.width);
++	c.size[1] = float(g.height);
++	c.stepSize[0] = bw * float(source->width) / float(g.width);
++	c.stepSize[1] = bh * float(source->height) / float(g.height);
++	for (int i = 0; i < 4; ++i) {
++		c.tanNow[i] = now.tangents[i];
++		c.tanThen[i] = cut ? now.tangents[i] : history.tangents[i];
++	}
++	float* rows[3] = { c.row0, c.row1, c.row2 };
++	for (int i = 0; i < 3; ++i) {
++		rows[i][0] = r[i][0];
++		rows[i][1] = r[i][1];
++		rows[i][2] = r[i][2];
++		rows[i][3] = t[i];
++	}
++	c.k = now.k;
++	c.m22 = now.m22;
++	c.nearRef = now.nearRef;
++	c.mode = (cut ? 1u : 0u) | (source->multisampled ? 2u : 0u);
++
++	// this frame is the next one's previous, handed or not: the layer's history follows the game's frames
++	history.valid = true;
++	history.pose = in.pose;
++	for (int i = 0; i < 4; ++i)
++		history.tangents[i] = now.tangents[i];
++	history.atMs = in.nowMs;
++
++	UINT depthKey = 0, motionKey = 0;
++	if (!Take(g.depth[eye].mutex, depthKey)) {
++		++g.total.busy;
++		++g.wBusy;
++		return false;
++	}
++	if (!Take(g.motion[eye].mutex, motionKey)) {
++		g.depth[eye].mutex->ReleaseSync(depthKey); // as it was
++		++g.total.busy;
++		++g.wBusy;
++		return false;
++	}
++	Dispatch(eye, *source, c);
++	g.depth[eye].mutex->ReleaseSync(1);
++	g.motion[eye].mutex->ReleaseSync(1);
++	// the pass submitted now: a reader on another device (the bridge host's layer, SSW's route) waits on the GPU for it,
++	// and nothing else may submit the game's context before that reader is answered (desk test, 2026-11-20: a second
++	// process's read waited for ever without it). rever_vk_depth's producer flushes after its keys likewise.
++	g.context->Flush();
++	g.block->eyes[eye].phase = 0;
++	MemoryBarrier();
++	InterlockedIncrement(&g.block->eyes[eye].seq);
++
++	++g.total.produced;
++	++g.wProduced;
++	if (cut) {
++		++g.total.resets;
++		++g.wResets;
++	}
++	if (!g.saidFirst[eye]) {
++		g.saidFirst[eye] = true;
++		char view[160] = "";
++		if (in.hasViewTangents)
++			snprintf(view, sizeof(view), " (the OpenXR view's: l %.4f r %.4f u %.4f d %.4f)", in.viewTangents[0], in.viewTangents[1],
++			    in.viewTangents[2], in.viewTangents[3]);
++		Say("eye %d first handed to Rever's layer: %ux%u from the game's depth %ux%u at %d,%d (%.3f x %.3f depth pixels a pixel); "
++		    "inverted depth, near_ref %.5f m (k %.6f, P22 %.6f); projection tangents l %.4f r %.4f u %.4f d %.4f%s",
++		    eye, g.width, g.height, source->width, source->height, c.origin[0], c.origin[1], c.stepSize[0], c.stepSize[1],
++		    now.nearRef, now.k, now.m22, now.tangents[0], now.tangents[1], now.tangents[2], now.tangents[3], view);
++	}
++	return true;
++}
++
++Stats CurrentStats()
++{
++	Stats s = g.total;
++	s.width = g.width;
++	s.height = g.height;
++	s.generation = g.generation;
++	s.broken = g.broken;
++	return s;
++}
++
++void TestReset()
++{
++	DropDevice();
++	if (g.block)
++		UnmapViewOfFile(g.block);
++	if (g.blockMap)
++		CloseHandle(g.blockMap);
++	g = State{};
++}
++
++void TestSetLog(void (*sink)(const char* line))
++{
++	g_sink = sink;
++}
++
++#ifdef REVER_GAME_DEPTH_STANDALONE
++void TestSetNames(const wchar_t* block, const wchar_t* texturePrefix)
++{
++	g_blockName = block;
++	g_texturePrefix = texturePrefix;
++}
++#endif
++
++} // namespace rever_game_depth
++
++#ifndef REVER_GAME_DEPTH_STANDALONE
++#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
++namespace {
++struct OpenVRDepthInfo { // vr::VRTextureDepthInfo_t
++	void* handle;
++	float mProjection[4][4];
++	float vRange[2];
++};
++static_assert(sizeof(OpenVRDepthInfo) == 80, "OpenVR's layout");
++static_assert(sizeof(vr::Texture_t) == 16, "OpenVR's layout");
++constexpr size_t kTextureWithPoseSize = 64; // vr::VRTextureWithPose_t: Texture_t + HmdMatrix34_t
++
++// The eye's rectangle as Compositor::Invoke will hand it to OpenXR (its own CalculateViewport on the same numbers), before
++// the copy: the size rever_xr_nr compares the channel's with.
++XrRect2Di EyeRect(Compositor& comp, const vr::VRTextureBounds_t* bounds, uint32_t texW, uint32_t texH)
++{
++	if (bounds && bounds->vMin == 0.0f && bounds->vMax == 1.0f && bounds->uMin == 0.0f && bounds->uMax == 1.0f)
++		bounds = nullptr;
++	XrRect2Di rect{};
++	if (!oovr_global_configuration.InvertUsingShaders()) {
++		// the whole texture copied, the eye's bounds as the view's rectangle
++		comp.CalculateViewport(bounds, static_cast<int32_t>(texW), static_cast<int32_t>(texH), true, rect);
++		return rect;
++	}
++	// DX11Compositor::CheckCreateSwapChain: a swapchain of the bounds' part of the texture, the whole of it the rectangle
++	uint32_t w = texW, h = texH;
++	if (bounds) {
++		if (std::fabs(bounds->uMax - bounds->uMin) > 0.1)
++			w = uint32_t(float(texW) * std::fabs(bounds->uMax - bounds->uMin));
++		if (std::fabs(bounds->vMax - bounds->vMin) > 0.1)
++			h = uint32_t(float(texH) * std::fabs(bounds->vMax - bounds->vMin));
++	}
++	comp.CalculateViewport(nullptr, static_cast<int32_t>(w), static_cast<int32_t>(h), true, rect);
++	return rect;
++}
++} // namespace
++
++void ReverGameDepthSubmit(int eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, uint32_t submitFlags,
++    const XrPosef& pose, const XrFovf& fov, Compositor& comp)
++{
++	if (!rever_game_depth::Armed() || eye < 0 || eye > 1 || !texture || !texture->handle || texture->eType != vr::TextureType_DirectX)
++		return;
++	ID3D11Texture2D* colour = nullptr;
++	if (FAILED(static_cast<IUnknown*>(texture->handle)->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&colour)))
++	    || !colour)
++		return;
++	D3D11_TEXTURE2D_DESC colourDesc{};
++	colour->GetDesc(&colourDesc);
++	colour->Release();
++
++	rever_game_depth::EyeInput in;
++	in.nowMs = GetTickCount64();
++	in.submitFlags = submitFlags;
++	const char* base = reinterpret_cast<const char*>(texture);
++	const bool withPose = (submitFlags & 0x08) != 0;
++	if (submitFlags & 0x10) { // Submit_TextureWithDepth: its depth after Texture_t, or after VRTextureWithPose_t
++		const auto* depth = reinterpret_cast<const OpenVRDepthInfo*>(base + (withPose ? kTextureWithPoseSize : sizeof(vr::Texture_t)));
++		if (depth->handle)
++			static_cast<IUnknown*>(depth->handle)->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&in.depth));
++		std::memcpy(in.projection, depth->mProjection, sizeof(in.projection));
++		in.vRange[0] = depth->vRange[0];
++		in.vRange[1] = depth->vRange[1];
++	}
++	if (withPose) { // the game's render pose (diagnostics): HmdMatrix34_t mDeviceToAbsoluteTracking, its rotation
++		const auto* m = reinterpret_cast<const float(*)[4]>(base + sizeof(vr::Texture_t));
++		for (int i = 0; i < 3; ++i)
++			for (int j = 0; j < 3; ++j)
++				in.renderRotation[i][j] = m[i][j];
++		in.hasRenderRotation = true;
++	}
++	if (bounds) {
++		in.bounds[0] = bounds->uMin;
++		in.bounds[1] = bounds->uMax;
++		in.bounds[2] = bounds->vMin;
++		in.bounds[3] = bounds->vMax;
++	}
++	in.pose.orientation[0] = pose.orientation.x;
++	in.pose.orientation[1] = pose.orientation.y;
++	in.pose.orientation[2] = pose.orientation.z;
++	in.pose.orientation[3] = pose.orientation.w;
++	in.pose.position[0] = pose.position.x;
++	in.pose.position[1] = pose.position.y;
++	in.pose.position[2] = pose.position.z;
++	in.viewTangents[0] = std::tan(fov.angleLeft);
++	in.viewTangents[1] = std::tan(fov.angleRight);
++	in.viewTangents[2] = std::tan(fov.angleUp);
++	in.viewTangents[3] = std::tan(fov.angleDown);
++	in.hasViewTangents = true;
++	const XrRect2Di rect = EyeRect(comp, bounds, colourDesc.Width, colourDesc.Height);
++	in.width = rect.extent.width;
++	in.height = rect.extent.height;
++	rever_game_depth::ProduceEye(eye, in);
++	if (in.depth)
++		in.depth->Release();
++}
++#endif // SUPPORT_DX && SUPPORT_DX11
++#endif // !REVER_GAME_DEPTH_STANDALONE
++
++#endif // _WIN32
+diff --git a/DrvOpenXR/ReverGameDepth.h b/DrvOpenXR/ReverGameDepth.h
+new file mode 100644
+index 0000000..556bba8
+--- /dev/null
++++ b/DrvOpenXR/ReverGameDepth.h
+@@ -0,0 +1,66 @@
++// Rever VR (GPL-3.0, Rever's OpenComposite), 2026-11-19 - Half-Life: Alyx's own depth for Rever's DLSS / FSR (KB ALX-002,
++// step 2; user: "si"). See ReverGameDepth.cpp.
++#pragma once
++
++#include <cstdint>
++
++struct ID3D11Texture2D;
++
++namespace rever_game_depth {
++
++struct Pose {
++	float orientation[4] = { 0, 0, 0, 1 }; // x, y, z, w
++	float position[3] = { 0, 0, 0 }; // metres
++};
++
++// One eye's submit as the producer takes it (ReverGameDepthSubmit fills it from OpenVR's / OpenComposite's own data;
++// the desk test fills it by hand).
++struct EyeInput {
++	ID3D11Texture2D* depth = nullptr; // the game's depth (VRTextureDepthInfo_t::handle); null: none this frame
++	float projection[4][4] = {}; // VRTextureDepthInfo_t::mProjection (OpenVR's, row-major)
++	float vRange[2] = { 0, 1 }; // VRTextureDepthInfo_t::vRange (logged only)
++	float bounds[4] = { 0, 1, 0, 1 }; // uMin, uMax, vMin, vMax: the eye's part of the depth texture
++	Pose pose; // the eye's pose this frame (the OpenXR view OpenComposite hands down for it)
++	int32_t width = 0, height = 0; // the eye as Rever's layer sees it (the projection view's imageRect extent)
++	uint32_t submitFlags = 0; // OpenVR's (0x20: a discontinuity)
++	uint64_t nowMs = 0; // GetTickCount64()
++	// diagnostics only: the game's render pose (VRTextureWithPose_t, its rotation) and the OpenXR view's tangents
++	bool hasRenderRotation = false;
++	float renderRotation[3][3] = {};
++	bool hasViewTangents = false;
++	float viewTangents[4] = {}; // left, right, up, down
++};
++
++// REVER_ALYX_GAME_DEPTH=1 in the environment (Rever's session file): read once. Anything else: no producer at all.
++bool Armed();
++// Writes this eye's depth and motion into Rever's channel; false when it did not (none, skipped, off).
++bool ProduceEye(int eye, const EyeInput& in);
++
++// The desk test's view of it.
++struct Stats {
++	uint64_t produced = 0, busy = 0, sizeSkips = 0, otherSkips = 0, resets = 0, noDepth = 0;
++	uint32_t width = 0, height = 0;
++	long generation = 0;
++	bool broken = false;
++};
++Stats CurrentStats();
++void TestReset(); // drops everything (outputs, device, history) and reads the switch again
++void TestSetLog(void (*sink)(const char* line));
++#ifdef REVER_GAME_DEPTH_STANDALONE
++// the desk test's own names (the DLL always uses rever_xr_nr's): a running game's channel is never touched
++void TestSetNames(const wchar_t* block, const wchar_t* texturePrefix);
++#endif
++
++} // namespace rever_game_depth
++
++#ifndef REVER_GAME_DEPTH_STANDALONE
++#include "generated/interfaces/vrtypes.h"
++#include <openxr/openxr.h>
++
++class Compositor;
++
++// XrBackend::StoreEyeTexture, before the eye's colour is copied (Compositor::Invoke releases the eye's swapchain image,
++// where rever_xr_nr upscales it): the producer for this eye. Nothing unless REVER_ALYX_GAME_DEPTH=1.
++void ReverGameDepthSubmit(int eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, uint32_t submitFlags,
++    const XrPosef& pose, const XrFovf& fov, Compositor& comp);
++#endif
+diff --git a/DrvOpenXR/ReverGameDepthTest.cpp b/DrvOpenXR/ReverGameDepthTest.cpp
+new file mode 100644
+index 0000000..35ad928
+--- /dev/null
++++ b/DrvOpenXR/ReverGameDepthTest.cpp
+@@ -0,0 +1,1184 @@
++// Rever VR (GPL-3.0), 2026-11-19 - desk test of ReverGameDepth.cpp (Half-Life: Alyx's depth for Rever's layer, KB ALX-002
++// step 2) without the game: a synthetic D24S8 depth drawn on a D3D11 device in Alyx's layout (both eyes side by side in a
++// larger texture, its bounds, its projection with the Z row remapped to 0.05..0.95), the producer run on it, and the
++// channel read back exactly as rever_xr_nr's SrTakeInputs reads it (its logic copied below): the block's fields, the
++// sizes, the inverted depth, the camera's motion of a static scene under a head turn against an independent CPU
++// reprojection (ray-traced world points through 4x4 matrices), the sky, the cuts (flag 0x20, a jump, a gap, a new
++// size), a busy key (skipped, never waited for), the game's compute / output-merger state given back, the switch, and a
++// second process reading the channel on its own device (the bridge host's case).
++//
++// Built apart from OpenComposite (cl, see the staging folder's build_desk_test.bat):
++//   cl /nologo /EHsc /O2 /std:c++17 /DREVER_GAME_DEPTH_STANDALONE ReverGameDepth.cpp ReverGameDepthTest.cpp
++//      d3d11.lib dxgi.lib d3dcompiler.lib
++#define NOMINMAX
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++#include <d3d11_1.h>
++#include <d3dcompiler.h>
++#include <dxgi1_2.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "ReverGameDepth.h"
++
++using rever_game_depth::EyeInput;
++using rever_game_depth::Pose;
++
++namespace {
++
++int g_failures = 0;
++int g_checks = 0;
++
++void Check(bool ok, const char* what, const char* detail = "")
++{
++	++g_checks;
++	if (!ok)
++		++g_failures;
++	std::printf("[%s] %s%s%s\n", ok ? "PASS" : "FAIL", what, detail[0] ? ": " : "", detail);
++}
++
++template <typename T>
++void SafeRelease(T*& p)
++{
++	if (p)
++		p->Release();
++	p = nullptr;
++}
++
++// The desk test's own channel: rever_xr_nr's names with a suffix, so a game running meanwhile (Dishonored's helper and
++// Batman's producer write the real Local\ReverVR_DLSS_SR_Inputs) is never touched. The DLL has no way to use these.
++const wchar_t kBlockName[] = L"Local\\ReverVR_DLSS_SR_Inputs_ReverDeskTest";
++const wchar_t kTexturePrefix[] = L"Local\\ReverVR_SR_ReverDeskTest_";
++
++// --- Alyx's numbers ------------------------------------------------------------------------------------------------
++constexpr float kP22 = -0.950057f, kP23 = -0.0374928f; // its Z row (KB ALX-002, the headset's probe)
++constexpr double kNearRef = double(kP23) / double(kP22); // the nearest view distance the buffer holds (raw depth 0)
++
++struct Eye {
++	double tangents[4]; // left, right, up, down
++	double rotation[3][3]; // view -> world
++	double position[3];
++};
++
++void QuatFromYawPitch(double yawDeg, double pitchDeg, double q[4])
++{
++	const double y = yawDeg * 3.14159265358979 / 360.0, p = pitchDeg * 3.14159265358979 / 360.0;
++	// q = qYaw (about +y) * qPitch (about +x)
++	const double qy[4] = { 0, std::sin(y), 0, std::cos(y) }, qp[4] = { std::sin(p), 0, 0, std::cos(p) };
++	q[0] = qy[3] * qp[0] + qy[0] * qp[3] + qy[1] * qp[2] - qy[2] * qp[1];
++	q[1] = qy[3] * qp[1] - qy[0] * qp[2] + qy[1] * qp[3] + qy[2] * qp[0];
++	q[2] = qy[3] * qp[2] + qy[0] * qp[1] - qy[1] * qp[0] + qy[2] * qp[3];
++	q[3] = qy[3] * qp[3] - qy[0] * qp[0] - qy[1] * qp[1] - qy[2] * qp[2];
++}
++
++void QuatToMatrix(const double q[4], double m[3][3])
++{
++	const double x = q[0], y = q[1], z = q[2], w = q[3];
++	m[0][0] = 1 - 2 * (y * y + z * z);
++	m[0][1] = 2 * (x * y - z * w);
++	m[0][2] = 2 * (x * z + y * w);
++	m[1][0] = 2 * (x * y + z * w);
++	m[1][1] = 1 - 2 * (x * x + z * z);
++	m[1][2] = 2 * (y * z - x * w);
++	m[2][0] = 2 * (x * z - y * w);
++	m[2][1] = 2 * (y * z + x * w);
++	m[2][2] = 1 - 2 * (x * x + y * y);
++}
++
++struct Head {
++	double q[4];
++	double position[3];
++};
++
++Eye MakeEye(int e, const Head& head)
++{
++	Eye eye{};
++	// the left eye's tangents of the headset probe's mProjection, mirrored for the right
++	const double left[4] = { -1.4919, 1.0938, 1.0520, -1.5582 };
++	eye.tangents[0] = e == 0 ? left[0] : -left[1];
++	eye.tangents[1] = e == 0 ? left[1] : -left[0];
++	eye.tangents[2] = left[2];
++	eye.tangents[3] = left[3];
++	QuatToMatrix(head.q, eye.rotation);
++	const double offset = e == 0 ? -0.032 : 0.032;
++	for (int i = 0; i < 3; ++i)
++		eye.position[i] = head.position[i] + eye.rotation[i][0] * offset;
++	return eye;
++}
++
++void Projection(const Eye& eye, float P[4][4])
++{
++	std::memset(P, 0, sizeof(float) * 16);
++	const double l = eye.tangents[0], r = eye.tangents[1], u = eye.tangents[2], d = eye.tangents[3];
++	P[0][0] = float(2.0 / (r - l));
++	P[0][2] = float((r + l) / (r - l));
++	P[1][1] = float(2.0 / (u - d));
++	P[1][2] = float((u + d) / (u - d));
++	P[2][2] = kP22;
++	P[2][3] = kP23;
++	P[3][2] = -1.f;
++}
++
++// The scene (world metres): a wall at z = -6, a floor at y = -1.6, a sphere; anything else is the sky. Object id: 0 sky.
++double Hit(const double o[3], const double d[3], int& id)
++{
++	double best = -1;
++	id = 0;
++	const double c[3] = { 0.4, 0.0, -2.5 }, radius = 0.6;
++	const double oc[3] = { o[0] - c[0], o[1] - c[1], o[2] - c[2] };
++	const double a = d[0] * d[0] + d[1] * d[1] + d[2] * d[2], b = oc[0] * d[0] + oc[1] * d[1] + oc[2] * d[2];
++	const double cc = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - radius * radius;
++	const double disc = b * b - a * cc;
++	if (disc >= 0) {
++		const double s = (-b - std::sqrt(disc)) / a;
++		if (s > 0) {
++			best = s;
++			id = 1;
++		}
++	}
++	if (d[2] < 0) {
++		const double s = (-6.0 - o[2]) / d[2];
++		const double x = o[0] + s * d[0], y = o[1] + s * d[1];
++		if (s > 0 && x > -4 && x < 4 && y > -1.6 && y < 2.5 && (best < 0 || s < best)) {
++			best = s;
++			id = 2;
++		}
++	}
++	if (d[1] < 0) {
++		const double s = (-1.6 - o[1]) / d[1];
++		const double x = o[0] + s * d[0], z = o[2] + s * d[2];
++		if (s > 0 && x > -4 && x < 4 && z > -6 && z < 1 && (best < 0 || s < best)) {
++			best = s;
++			id = 3;
++		}
++	}
++	return best;
++}
++
++const char kSceneShader[] = R"(
++cbuffer Scene : register(b0) {
++    float4 rect; float4 tangents; float4 rot0; float4 rot1; float4 rot2; float4 position; float4 depthMap;
++};
++float4 VS(uint id : SV_VertexID) : SV_Position {
++    float2 uv = float2((id << 1) & 2, id & 2);
++    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
++}
++float Hit(float3 o, float3 d) {
++    float best = -1;
++    float3 c = float3(0.4, 0.0, -2.5);
++    float3 oc = o - c;
++    float a = dot(d, d), b = dot(oc, d), cc = dot(oc, oc) - 0.36;
++    float disc = b * b - a * cc;
++    if (disc >= 0) { float s = (-b - sqrt(disc)) / a; if (s > 0) best = s; }
++    if (d.z < 0) {
++        float s = (-6.0 - o.z) / d.z; float x = o.x + s * d.x, y = o.y + s * d.y;
++        if (s > 0 && x > -4 && x < 4 && y > -1.6 && y < 2.5 && (best < 0 || s < best)) best = s;
++    }
++    if (d.y < 0) {
++        float s = (-1.6 - o.y) / d.y; float x = o.x + s * d.x, z = o.z + s * d.z;
++        if (s > 0 && x > -4 && x < 4 && z > -6 && z < 1 && (best < 0 || s < best)) best = s;
++    }
++    return best;
++}
++float PS(float4 pos : SV_Position) : SV_Depth {
++    float2 uv = (pos.xy - rect.xy) / rect.zw;
++    float3 v = float3(lerp(tangents.x, tangents.y, uv.x), lerp(tangents.z, tangents.w, uv.y), -1);
++    float3 d = float3(dot(rot0.xyz, v), dot(rot1.xyz, v), dot(rot2.xyz, v));
++    float s = Hit(position.xyz, d);
++    if (s <= 0) discard;
++    return -depthMap.x + depthMap.y / s;
++}
++)";
++
++struct SceneConstants {
++	float rect[4];
++	float tangents[4];
++	float rot0[4], rot1[4], rot2[4];
++	float position[4];
++	float depthMap[4];
++};
++
++struct Gpu {
++	ID3D11Device* device = nullptr;
++	ID3D11Device1* device1 = nullptr;
++	ID3D11DeviceContext* ctx = nullptr;
++	ID3D11VertexShader* vs = nullptr;
++	ID3D11PixelShader* ps = nullptr;
++	ID3D11Buffer* cb = nullptr;
++	ID3D11DepthStencilState* always = nullptr;
++	ID3D11RasterizerState* raster = nullptr;
++};
++
++ID3DBlob* Compile(const char* source, const char* entry, const char* target)
++{
++	ID3DBlob* code = nullptr;
++	ID3DBlob* errors = nullptr;
++	if (FAILED(D3DCompile(source, std::strlen(source), "test", nullptr, nullptr, entry, target, 0, 0, &code, &errors))) {
++		std::printf("shader %s: %s\n", entry, errors ? (const char*)errors->GetBufferPointer() : "?");
++		std::exit(2);
++	}
++	SafeRelease(errors);
++	return code;
++}
++
++bool MakeGpu(Gpu& g)
++{
++	const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
++	if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &g.device, nullptr, &g.ctx)))
++		return false;
++	g.device->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&g.device1));
++	ID3DBlob* vs = Compile(kSceneShader, "VS", "vs_5_0");
++	ID3DBlob* ps = Compile(kSceneShader, "PS", "ps_5_0");
++	g.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.vs);
++	g.device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.ps);
++	SafeRelease(vs);
++	SafeRelease(ps);
++	D3D11_BUFFER_DESC cb{};
++	cb.ByteWidth = sizeof(SceneConstants);
++	cb.Usage = D3D11_USAGE_DEFAULT;
++	cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++	g.device->CreateBuffer(&cb, nullptr, &g.cb);
++	D3D11_DEPTH_STENCIL_DESC ds{};
++	ds.DepthEnable = TRUE;
++	ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
++	ds.DepthFunc = D3D11_COMPARISON_ALWAYS;
++	g.device->CreateDepthStencilState(&ds, &g.always);
++	D3D11_RASTERIZER_DESC rd{};
++	rd.FillMode = D3D11_FILL_SOLID;
++	rd.CullMode = D3D11_CULL_NONE;
++	rd.DepthClipEnable = FALSE;
++	g.device->CreateRasterizerState(&rd, &g.raster);
++	return g.device1 && g.vs && g.ps && g.cb && g.always && g.raster;
++}
++
++struct DepthTarget {
++	ID3D11Texture2D* texture = nullptr;
++	ID3D11DepthStencilView* dsv = nullptr;
++	uint32_t width = 0, height = 0;
++};
++
++DepthTarget MakeDepth(Gpu& g, uint32_t w, uint32_t h, uint32_t samples)
++{
++	DepthTarget t;
++	t.width = w;
++	t.height = h;
++	D3D11_TEXTURE2D_DESC d{};
++	d.Width = w;
++	d.Height = h;
++	d.MipLevels = d.ArraySize = 1;
++	d.Format = DXGI_FORMAT_R24G8_TYPELESS; // Alyx's: DXGI 44, bind 0x48
++	d.SampleDesc.Count = samples;
++	d.Usage = D3D11_USAGE_DEFAULT;
++	d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
++	g.device->CreateTexture2D(&d, nullptr, &t.texture);
++	D3D11_DEPTH_STENCIL_VIEW_DESC v{};
++	v.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
++	v.ViewDimension = samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
++	g.device->CreateDepthStencilView(t.texture, &v, &t.dsv);
++	return t;
++}
++
++struct Layout {
++	uint32_t texW, texH;
++	float bounds[2][4]; // per eye: uMin, uMax, vMin, vMax (as Alyx computes them: render size / texture size)
++	int32_t width, height; // the eye as OpenComposite's Compositor::CalculateViewport makes it
++	int32_t origin[2][2];
++};
++
++Layout MakeLayout(uint32_t renderSize, uint32_t texW, uint32_t texH)
++{
++	Layout l{};
++	l.texW = texW;
++	l.texH = texH;
++	const float a = float(renderSize) / float(texW), b = float(2 * renderSize) / float(texW), v = float(renderSize) / float(texH);
++	const float bounds[2][4] = { { 0.f, a, 0.f, v }, { a, b, 0.f, v } };
++	std::memcpy(l.bounds, bounds, sizeof(bounds));
++	// Compositor::CalculateViewport's own arithmetic
++	l.width = (int)((a - 0.f) * (float)texW);
++	l.height = (int)((v - 0.f) * (float)texH);
++	for (int e = 0; e < 2; ++e) {
++		l.origin[e][0] = (int)(l.bounds[e][0] * (float)texW);
++		l.origin[e][1] = (int)(l.bounds[e][2] * (float)texH);
++	}
++	return l;
++}
++
++void DrawDepth(Gpu& g, DepthTarget& t, const Layout& l, const Eye eyes[2], bool clear = true)
++{
++	if (clear)
++		g.ctx->ClearDepthStencilView(t.dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
++	g.ctx->OMSetRenderTargets(0, nullptr, t.dsv);
++	g.ctx->OMSetDepthStencilState(g.always, 0);
++	g.ctx->RSSetState(g.raster);
++	g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++	g.ctx->IASetInputLayout(nullptr);
++	g.ctx->VSSetShader(g.vs, nullptr, 0);
++	g.ctx->PSSetShader(g.ps, nullptr, 0);
++	g.ctx->PSSetConstantBuffers(0, 1, &g.cb);
++	for (int e = 0; e < 2; ++e) {
++		SceneConstants c{};
++		c.rect[0] = float(l.origin[e][0]);
++		c.rect[1] = float(l.origin[e][1]);
++		c.rect[2] = float(l.width);
++		c.rect[3] = float(l.height);
++		for (int i = 0; i < 4; ++i)
++			c.tangents[i] = float(eyes[e].tangents[i]);
++		float* rows[3] = { c.rot0, c.rot1, c.rot2 };
++		for (int i = 0; i < 3; ++i)
++			for (int j = 0; j < 3; ++j)
++				rows[i][j] = float(eyes[e].rotation[i][j]);
++		for (int i = 0; i < 3; ++i)
++			c.position[i] = float(eyes[e].position[i]);
++		c.depthMap[0] = kP22;
++		c.depthMap[1] = kP23;
++		g.ctx->UpdateSubresource(g.cb, 0, nullptr, &c, 0, 0);
++		D3D11_VIEWPORT vp{ float(l.origin[e][0]), float(l.origin[e][1]), float(l.width), float(l.height), 0.f, 1.f };
++		g.ctx->RSSetViewports(1, &vp);
++		g.ctx->Draw(3, 0);
++	}
++	g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
++}
++
++EyeInput Input(const DepthTarget& t, const Layout& l, const Eye& eye, int e, uint64_t nowMs, uint32_t flags = 0x218)
++{
++	EyeInput in;
++	in.depth = t.texture;
++	Projection(eye, in.projection);
++	std::memcpy(in.bounds, l.bounds[e], sizeof(in.bounds));
++	// the pose as OpenXR hands it: a quaternion of the rotation
++	const double(*m)[3] = eye.rotation;
++	const double trace = m[0][0] + m[1][1] + m[2][2];
++	double q[4];
++	if (trace > 0) {
++		const double s = std::sqrt(trace + 1.0) * 2;
++		q[3] = 0.25 * s;
++		q[0] = (m[2][1] - m[1][2]) / s;
++		q[1] = (m[0][2] - m[2][0]) / s;
++		q[2] = (m[1][0] - m[0][1]) / s;
++	} else {
++		q[0] = 0, q[1] = 0, q[2] = 0, q[3] = 1; // never in this test (small turns)
++	}
++	for (int i = 0; i < 4; ++i)
++		in.pose.orientation[i] = float(q[i]);
++	for (int i = 0; i < 3; ++i)
++		in.pose.position[i] = float(eye.position[i]);
++	in.width = l.width;
++	in.height = l.height;
++	in.submitFlags = flags;
++	in.nowMs = nowMs;
++	return in;
++}
++
++// --- rever_xr_nr's SrTakeInputs (layer.cpp 4138-4206), its logic copied ---------------------------------------------
++struct SrInputsBlock {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t pid;
++	volatile LONG generation;
++	uint32_t width, height;
++	uint32_t flags;
++	uint32_t reserved;
++	struct EyeBlock {
++		volatile LONG seq;
++		uint32_t phase;
++		uint32_t reserved[2];
++	} eyes[2];
++};
++constexpr uint32_t kSrInputsMagic = 0x49535652;
++
++enum TakeResult { kTaken, kNoBlock, kBadBlock, kSizeRefused, kOpenFailed, kNothingNew, kBusy };
++
++struct LayerReader {
++	ID3D11Device1* device1 = nullptr;
++	ID3D11DeviceContext* ctx = nullptr;
++	HANDLE map = nullptr;
++	const SrInputsBlock* block = nullptr;
++	LONG generation = 0;
++	ID3D11Texture2D* depth[2] = {};
++	ID3D11Texture2D* motion[2] = {};
++	IDXGIKeyedMutex* depthMutex[2] = {};
++	IDXGIKeyedMutex* motionMutex[2] = {};
++	LONG seq[2] = {};
++	bool inverted = false;
++	uint32_t phase = 0;
++	HRESULT lastAcquire = S_OK; // diagnostics: the last AcquireSync's answer
++
++	void CloseTextures()
++	{
++		for (int e = 0; e < 2; ++e) {
++			SafeRelease(depthMutex[e]);
++			SafeRelease(motionMutex[e]);
++			SafeRelease(depth[e]);
++			SafeRelease(motion[e]);
++			seq[e] = 0;
++		}
++	}
++	void Close()
++	{
++		CloseTextures();
++		if (block)
++			UnmapViewOfFile(block);
++		if (map)
++			CloseHandle(map);
++		block = nullptr;
++		map = nullptr;
++		generation = 0;
++	}
++
++	static bool ReadBack(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11Texture2D* texture, std::vector<float>& out, int channels)
++	{
++		D3D11_TEXTURE2D_DESC d{};
++		texture->GetDesc(&d);
++		d.BindFlags = 0;
++		d.MiscFlags = 0;
++		d.Usage = D3D11_USAGE_STAGING;
++		d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++		ID3D11Texture2D* staging = nullptr;
++		if (FAILED(device->CreateTexture2D(&d, nullptr, &staging)))
++			return false;
++		ctx->CopyResource(staging, texture);
++		D3D11_MAPPED_SUBRESOURCE m{};
++		if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
++			staging->Release();
++			return false;
++		}
++		out.assign(size_t(d.Width) * d.Height * channels, 0.f);
++		for (uint32_t y = 0; y < d.Height; ++y) {
++			const uint8_t* row = static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch;
++			for (uint32_t x = 0; x < d.Width; ++x) {
++				if (channels == 1) {
++					std::memcpy(&out[size_t(y) * d.Width + x], row + x * 4, 4);
++				} else {
++					uint16_t h[2];
++					std::memcpy(h, row + x * 4, 4);
++					for (int c = 0; c < 2; ++c) {
++						const uint32_t s = (h[c] >> 15) & 1, ex = (h[c] >> 10) & 31, ma = h[c] & 1023;
++						float v = ex == 0 ? std::ldexp(float(ma), -24) : ex == 31 ? NAN : std::ldexp(float(ma | 1024), int(ex) - 25);
++						out[(size_t(y) * d.Width + x) * 2 + c] = s ? -v : v;
++					}
++				}
++			}
++		}
++		ctx->Unmap(staging, 0);
++		staging->Release();
++		return true;
++	}
++
++	TakeResult Take(uint32_t eye, uint32_t w, uint32_t h, DWORD waitMs, std::vector<float>* depthOut, std::vector<float>* motionOut)
++	{
++		if (!block) {
++			map = OpenFileMappingW(FILE_MAP_READ, FALSE, kBlockName); // the layer: L"Local\\ReverVR_DLSS_SR_Inputs"
++			if (!map)
++				return kNoBlock;
++			block = static_cast<const SrInputsBlock*>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(SrInputsBlock)));
++			if (!block || block->magic != kSrInputsMagic || block->version != 1) {
++				if (block)
++					UnmapViewOfFile(block);
++				CloseHandle(map);
++				block = nullptr;
++				map = nullptr;
++				return kBadBlock;
++			}
++		}
++		if (block->width != w || block->height != h)
++			return kSizeRefused;
++		const LONG gen = block->generation;
++		if (gen != generation) {
++			CloseTextures();
++			generation = gen;
++			for (uint32_t e = 0; e < 2; ++e)
++				for (int kind = 0; kind < 2; ++kind) {
++					wchar_t name[128]; // the layer: L"Local\\ReverVR_SR_%u_%ld_%u%c"
++					swprintf_s(name, L"%s%u_%ld_%u%c", kTexturePrefix, block->pid, gen, e, kind ? L'M' : L'D');
++					ID3D11Texture2D*& texture = kind ? motion[e] : depth[e];
++					IDXGIKeyedMutex*& mutex = kind ? motionMutex[e] : depthMutex[e];
++					if (FAILED(device1->OpenSharedResourceByName(name, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++					        __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture)))
++					    || FAILED(texture->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&mutex)))) {
++						CloseTextures();
++						return kOpenFailed;
++					}
++				}
++		}
++		const LONG s = block->eyes[eye].seq;
++		if (s == seq[eye])
++			return kNothingNew;
++		lastAcquire = depthMutex[eye]->AcquireSync(1, waitMs);
++		if (lastAcquire != S_OK)
++			return kBusy;
++		lastAcquire = motionMutex[eye]->AcquireSync(1, waitMs);
++		if (lastAcquire != S_OK) {
++			depthMutex[eye]->ReleaseSync(1);
++			return kBusy;
++		}
++		seq[eye] = s;
++		inverted = (block->flags & 1) != 0;
++		phase = block->eyes[eye].phase;
++		ID3D11Device* device = nullptr;
++		device1->QueryInterface(__uuidof(ID3D11Device), reinterpret_cast<void**>(&device));
++		if (depthOut)
++			ReadBack(device, ctx, depth[eye], *depthOut, 1);
++		if (motionOut)
++			ReadBack(device, ctx, motion[eye], *motionOut, 2);
++		device->Release();
++		depthMutex[eye]->ReleaseSync(0); // SrGiveBack
++		motionMutex[eye]->ReleaseSync(0);
++		return kTaken;
++	}
++};
++
++// --- the CPU's own answer ----------------------------------------------------------------------------------------------
++struct Expected {
++	std::vector<float> depth; // inverted, 0 for the sky
++	std::vector<float> motion; // x, y
++	std::vector<uint8_t> valid; // 1: compare (not on a silhouette, the point in the previous frame's view)
++	std::vector<uint8_t> sky;
++};
++
++Expected Reproject(const Eye& now, const Eye& before, const float Pbefore[4][4], int w, int h, bool withMotion)
++{
++	Expected x;
++	x.depth.assign(size_t(w) * h, 0.f);
++	x.motion.assign(size_t(w) * h * 2, 0.f);
++	x.valid.assign(size_t(w) * h, 0);
++	x.sky.assign(size_t(w) * h, 0);
++	std::vector<int> ids(size_t(w) * h, 0);
++	std::vector<double> dist(size_t(w) * h, -1);
++	for (int y = 0; y < h; ++y)
++		for (int xx = 0; xx < w; ++xx) {
++			const double u = (xx + 0.5) / w, v = (y + 0.5) / h;
++			const double vd[3] = { now.tangents[0] + (now.tangents[1] - now.tangents[0]) * u,
++				now.tangents[2] + (now.tangents[3] - now.tangents[2]) * v, -1.0 };
++			double wd[3];
++			for (int i = 0; i < 3; ++i)
++				wd[i] = now.rotation[i][0] * vd[0] + now.rotation[i][1] * vd[1] + now.rotation[i][2] * vd[2];
++			int id = 0;
++			const double s = Hit(now.position, wd, id);
++			ids[size_t(y) * w + xx] = id;
++			dist[size_t(y) * w + xx] = s;
++			x.depth[size_t(y) * w + xx] = s > 0 ? float(kNearRef / s) : 0.f;
++			x.sky[size_t(y) * w + xx] = s > 0 ? 0 : 1;
++			// where it was: the world point (or the direction, for the sky) through the previous eye's view and 4x4 projection
++			double rel[3];
++			if (s > 0) {
++				const double p[3] = { now.position[0] + s * wd[0] - before.position[0], now.position[1] + s * wd[1] - before.position[1],
++					now.position[2] + s * wd[2] - before.position[2] };
++				for (int i = 0; i < 3; ++i)
++					rel[i] = before.rotation[0][i] * p[0] + before.rotation[1][i] * p[1] + before.rotation[2][i] * p[2];
++			} else {
++				for (int i = 0; i < 3; ++i)
++					rel[i] = before.rotation[0][i] * wd[0] + before.rotation[1][i] * wd[1] + before.rotation[2][i] * wd[2];
++			}
++			const double clip[4] = { Pbefore[0][0] * rel[0] + Pbefore[0][1] * rel[1] + Pbefore[0][2] * rel[2],
++				Pbefore[1][0] * rel[0] + Pbefore[1][1] * rel[1] + Pbefore[1][2] * rel[2], 0.0, -rel[2] };
++			if (clip[3] <= 1e-6)
++				continue;
++			const double ub = clip[0] / clip[3] * 0.5 + 0.5, vb = 0.5 - clip[1] / clip[3] * 0.5;
++			if (withMotion) {
++				x.motion[(size_t(y) * w + xx) * 2] = float((ub - u) * w);
++				x.motion[(size_t(y) * w + xx) * 2 + 1] = float((vb - v) * h);
++			}
++			x.valid[size_t(y) * w + xx] = 1;
++		}
++	// not on a silhouette: the same object all around
++	for (int y = 0; y < h; ++y)
++		for (int xx = 0; xx < w; ++xx) {
++			if (y == 0 || xx == 0 || y == h - 1 || xx == w - 1) {
++				x.valid[size_t(y) * w + xx] = 0;
++				continue;
++			}
++			const int id = ids[size_t(y) * w + xx];
++			for (int dy = -1; dy <= 1; ++dy)
++				for (int dx = -1; dx <= 1; ++dx)
++					if (ids[size_t(y + dy) * w + xx + dx] != id)
++						x.valid[size_t(y) * w + xx] = 0;
++		}
++	return x;
++}
++
++struct Compare {
++	double depthMaxRel = 0, motionMax = 0, motionMean = 0, skyMotionMax = 0;
++	uint64_t compared = 0, bad = 0, skyPixels = 0, skyNonZeroDepth = 0;
++};
++
++Compare CompareEye(const Expected& x, const std::vector<float>& depth, const std::vector<float>& motion, bool motionZero)
++{
++	Compare c;
++	double sum = 0;
++	for (size_t i = 0; i < x.valid.size(); ++i) {
++		if (x.sky[i]) {
++			++c.skyPixels;
++			if (depth[i] != 0.f)
++				++c.skyNonZeroDepth;
++		}
++		if (!x.valid[i])
++			continue;
++		++c.compared;
++		const double ed = x.depth[i], gd = depth[i];
++		const double rel = std::fabs(gd - ed) / (ed > 1e-6 ? ed : 1.0);
++		if (rel > c.depthMaxRel)
++			c.depthMaxRel = rel;
++		const double ex = motionZero ? 0.0 : x.motion[i * 2], ey = motionZero ? 0.0 : x.motion[i * 2 + 1];
++		const double err = std::hypot(motion[i * 2] - ex, motion[i * 2 + 1] - ey);
++		const double tolerance = 0.1 + 0.002 * std::hypot(ex, ey);
++		if (err > tolerance || rel > 1e-4 || !std::isfinite(err))
++			++c.bad;
++		if (err > c.motionMax)
++			c.motionMax = err;
++		if (x.sky[i] && err > c.skyMotionMax)
++			c.skyMotionMax = err;
++		sum += err;
++	}
++	c.motionMean = c.compared ? sum / double(c.compared) : 0;
++	return c;
++}
++
++double MaxAbs(const std::vector<float>& v)
++{
++	double m = 0;
++	for (float f : v)
++		m = std::fabs(f) > m ? std::fabs(f) : m;
++	return m;
++}
++
++double MeanAbsMotion(const std::vector<float>& v)
++{
++	double s = 0;
++	for (size_t i = 0; i + 1 < v.size(); i += 2)
++		s += std::hypot(v[i], v[i + 1]);
++	return v.empty() ? 0 : s / double(v.size() / 2);
++}
++
++double Sum(const std::vector<float>& v)
++{
++	double s = 0;
++	for (float f : v)
++		s += f;
++	return s;
++}
++
++// --- a second process: the bridge host's layer, its own device, alive across frames ----------------------------------
++// As the real host it is up before the game's frames: it says it is ready, then takes each frame as the producer hands it
++// (SrTakeInputs' logic, LayerReader, the layer's own 2 ms wait) and gives it back with key 0, frame after frame. One line
++// per eye and frame. (2026-11-20: a reader process started only after the frame was handed, seconds later - a new exe
++// is scanned before it runs here - found the keys back at 0 in some runs and not in others; the host never works so.)
++const wchar_t kReadyEvent[] = L"Local\\ReverDeskTestReaderReady";
++const wchar_t kTakenEvent[] = L"Local\\ReverDeskTestReaderTaken";
++
++int ReaderProcess(uint32_t w, uint32_t h, int frames, unsigned long parent)
++{
++	ID3D11Device* device = nullptr;
++	ID3D11DeviceContext* ctx = nullptr;
++	const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
++	if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &device, nullptr, &ctx)))
++		return 3;
++	wchar_t name[96];
++	swprintf_s(name, L"%s_%lu", kReadyEvent, parent);
++	HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
++	swprintf_s(name, L"%s_%lu", kTakenEvent, parent);
++	HANDLE taken = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
++	if (!ready || !taken)
++		return 6;
++	LayerReader reader;
++	device->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&reader.device1));
++	reader.ctx = ctx;
++	SetEvent(ready);
++	int result = 0;
++	for (int frame = 0; frame < frames && !result; ++frame) {
++		for (uint32_t e = 0; e < 2; ++e) {
++			std::vector<float> depth, motion;
++			TakeResult r = kNoBlock;
++			const ULONGLONG until = GetTickCount64() + 20000;
++			while (r != kTaken && GetTickCount64() < until) {
++				r = reader.Take(e, w, h, 2, &depth, &motion);
++				if (r != kTaken)
++					Sleep(1);
++			}
++			if (r != kTaken) {
++				std::printf("READERFAIL frame %d eye %u result %d last AcquireSync 0x%08lx\n", frame, e, int(r),
++				    (unsigned long)reader.lastAcquire);
++				result = 4;
++				break;
++			}
++			std::printf("READER frame %d eye %u depth %.6f motion %.6f\n", frame, e, Sum(depth), MeanAbsMotion(motion));
++		}
++		SetEvent(taken);
++	}
++	std::printf("READER pid %lu done\n", GetCurrentProcessId());
++	reader.Close();
++	SafeRelease(reader.device1);
++	CloseHandle(ready);
++	CloseHandle(taken);
++	ctx->Release();
++	device->Release();
++	return result;
++}
++
++struct ReaderChild {
++	HANDLE process = nullptr;
++	HANDLE ready = nullptr;
++	HANDLE taken = nullptr;
++	std::wstring file;
++};
++
++bool StartReader(ReaderChild& c, uint32_t w, uint32_t h, int frames)
++{
++	wchar_t name[96];
++	swprintf_s(name, L"%s_%lu", kReadyEvent, GetCurrentProcessId());
++	c.ready = CreateEventW(nullptr, FALSE, FALSE, name);
++	swprintf_s(name, L"%s_%lu", kTakenEvent, GetCurrentProcessId());
++	c.taken = CreateEventW(nullptr, FALSE, FALSE, name);
++	wchar_t exe[MAX_PATH];
++	GetModuleFileNameW(nullptr, exe, MAX_PATH);
++	c.file = exe;
++	c.file = c.file.substr(0, c.file.find_last_of(L"\\/") + 1) + L"reader_answer.txt";
++	DeleteFileW(c.file.c_str());
++	wchar_t command[2 * MAX_PATH + 96];
++	swprintf_s(command, L"\"%s\" --reader %u %u \"%s\" %d %lu", exe, w, h, c.file.c_str(), frames, GetCurrentProcessId());
++	STARTUPINFOW si{ sizeof(si) };
++	PROCESS_INFORMATION pi{};
++	if (!c.ready || !c.taken || !CreateProcessW(nullptr, command, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
++		return false;
++	CloseHandle(pi.hThread);
++	c.process = pi.hProcess;
++	return true;
++}
++
++// true when the event came before the reader process ended (or the time ran out)
++bool WaitFor(const ReaderChild& c, HANDLE event, DWORD ms)
++{
++	HANDLE both[2] = { event, c.process };
++	return WaitForMultipleObjects(2, both, FALSE, ms) == WAIT_OBJECT_0;
++}
++
++std::string FinishReader(ReaderChild& c, DWORD& exitCode)
++{
++	exitCode = 999;
++	if (c.process) {
++		WaitForSingleObject(c.process, 30000);
++		GetExitCodeProcess(c.process, &exitCode);
++		CloseHandle(c.process);
++	}
++	if (c.ready)
++		CloseHandle(c.ready);
++	if (c.taken)
++		CloseHandle(c.taken);
++	c = ReaderChild{ nullptr, nullptr, nullptr, c.file };
++	std::string out;
++	FILE* f = nullptr;
++	if (_wfopen_s(&f, c.file.c_str(), L"rb") == 0 && f) {
++		char buffer[512];
++		size_t got = 0;
++		while ((got = std::fread(buffer, 1, sizeof(buffer), f)) > 0)
++			out.append(buffer, got);
++		std::fclose(f);
++	}
++	return out;
++}
++
++std::vector<std::string> g_logLines;
++void Sink(const char* line)
++{
++	g_logLines.push_back(line);
++	std::printf("  log> %s\n", line);
++}
++
++bool Logged(const char* part)
++{
++	for (const std::string& line : g_logLines)
++		if (line.find(part) != std::string::npos)
++			return true;
++	return false;
++}
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++	if (argc >= 7 && std::strcmp(argv[1], "--reader") == 0) { // the second process (StartReader)
++		FILE* answer = nullptr;
++		if (freopen_s(&answer, argv[4], "w", stdout) != 0)
++			return 5;
++		return ReaderProcess(uint32_t(std::atoi(argv[2])), uint32_t(std::atoi(argv[3])), std::atoi(argv[5]),
++		    std::strtoul(argv[6], nullptr, 10));
++	}
++	setvbuf(stdout, nullptr, _IONBF, 0);
++	rever_game_depth::TestSetLog(Sink);
++	rever_game_depth::TestSetNames(kBlockName, kTexturePrefix);
++	char text[512];
++
++	// --- the switch: off unless 1 -------------------------------------------------------------------------------------
++	SetEnvironmentVariableA("REVER_ALYX_GAME_DEPTH", "0");
++	rever_game_depth::TestReset();
++	Gpu gpu;
++	if (!MakeGpu(gpu)) {
++		std::printf("[FAIL] no D3D11 hardware device\n");
++		return 2;
++	}
++	const Layout layout = MakeLayout(532, 1507, 753); // Alyx's 2661 / 7534 x 3767, a fifth of it
++	DepthTarget target = MakeDepth(gpu, layout.texW, layout.texH, 1);
++	Head headA{ { 0, 0, 0, 1 }, { 0.1, 1.7 - 1.7, 0.2 } };
++	Eye a[2] = { MakeEye(0, headA), MakeEye(1, headA) };
++	DrawDepth(gpu, target, layout, a);
++	uint64_t now = 100000;
++	const bool offProduced = rever_game_depth::ProduceEye(0, Input(target, layout, a[0], 0, now));
++	HANDLE stray = OpenFileMappingW(FILE_MAP_READ, FALSE, kBlockName);
++	Check(!offProduced && !stray && Logged("off (REVER_ALYX_GAME_DEPTH=0)"), "REVER_ALYX_GAME_DEPTH=0: no producer, no block");
++	if (stray)
++		CloseHandle(stray);
++	SetEnvironmentVariableA("REVER_ALYX_GAME_DEPTH", nullptr);
++	rever_game_depth::TestReset();
++	Check(!rever_game_depth::ProduceEye(0, Input(target, layout, a[0], 0, now)) && Logged("off (REVER_ALYX_GAME_DEPTH=unset)"),
++	    "REVER_ALYX_GAME_DEPTH unset: no producer");
++	SetEnvironmentVariableA("REVER_ALYX_GAME_DEPTH", "1");
++	rever_game_depth::TestReset();
++
++	// --- the bridge host's case (SSW's and the stabiliser's routes): the only reader is another process, its own device ----
++	// (Alyx's own loader never runs Rever's layer then: REVER_XR_NR_DISABLE=1). It reads four frames as they are handed:
++	// the first a cut (zero motion), then a head turn each frame; its depth against the CPU's scene, its motion against the
++	// CPU's reprojection (the mean over the eye); the producer takes key 0 back from it every frame.
++	{
++		constexpr int kFrames = 4;
++		ReaderChild child;
++		const bool started = StartReader(child, uint32_t(layout.width), uint32_t(layout.height), kFrames);
++		const bool ready = started && WaitFor(child, child.ready, 60000); // its start can take seconds (a new exe scanned)
++		double expected[kFrames][2][2] = {};
++		bool handed = ready;
++		Eye before[2] = { a[0], a[1] };
++		for (int frame = 0; frame < kFrames && handed; ++frame) {
++			Head head{ {}, { 0.1 + 0.01 * frame, -0.005 * frame, 0.2 - 0.01 * frame } };
++			QuatFromYawPitch(2.0 * frame, -0.7 * frame, head.q);
++			Eye eyes[2] = { MakeEye(0, head), MakeEye(1, head) };
++			DrawDepth(gpu, target, layout, eyes);
++			now += 11;
++			for (int e = 0; e < 2; ++e) {
++				handed = rever_game_depth::ProduceEye(e, Input(target, layout, eyes[e], e, now)) && handed;
++				float P[4][4];
++				Projection(before[e], P);
++				const Expected x = Reproject(eyes[e], before[e], P, layout.width, layout.height, frame > 0);
++				expected[frame][e][0] = Sum(x.depth);
++				expected[frame][e][1] = frame > 0 ? MeanAbsMotion(x.motion) : 0.0;
++				before[e] = eyes[e];
++			}
++			handed = WaitFor(child, child.taken, 20000) && handed;
++		}
++		DWORD exitCode = 0;
++		const std::string out = FinishReader(child, exitCode);
++		int lines = 0, good = 0;
++		double worstDepth = 0, worstMotion = 0;
++		for (size_t at = out.find("READER frame"); at != std::string::npos; at = out.find("READER frame", at + 1)) {
++			int frame = -1;
++			unsigned eye = 9;
++			double depthSum = 0, motionMean = 0;
++			if (std::sscanf(out.c_str() + at, "READER frame %d eye %u depth %lf motion %lf", &frame, &eye, &depthSum, &motionMean) != 4 ||
++			    frame < 0 || frame >= kFrames || eye > 1)
++				continue;
++			++lines;
++			const double ed = expected[frame][eye][0], em = expected[frame][eye][1];
++			const double relDepth = std::fabs(depthSum - ed) / (ed > 0 ? ed : 1.0);
++			const double motionErr = std::fabs(motionMean - em);
++			worstDepth = relDepth > worstDepth ? relDepth : worstDepth;
++			worstMotion = motionErr > worstMotion ? motionErr : worstMotion;
++			if (relDepth < 2e-3 && motionErr <= 0.05 + 0.02 * em && (frame > 0 || motionMean == 0.0))
++				++good;
++		}
++		snprintf(text, sizeof(text), "started %d, ready %d, all handed and taken %d, exit %lu, %d of %d eye-frames read and right "
++		    "(depth sum rel err max %.1e, mean |motion| err max %.4f px; frame 3 mean |motion| %.2f px)",
++		    int(started), int(ready), int(handed), exitCode, good, lines, worstDepth, worstMotion, expected[kFrames - 1][0][1]);
++		if (good != 2 * kFrames)
++			std::printf("  reader process said: %s", out.c_str());
++		Check(started && ready && handed && exitCode == 0 && lines == 2 * kFrames && good == 2 * kFrames,
++		    "another process, its own device, frame after frame: takes key 1, reads the depth and the camera's motion, gives key 0 "
++		    "back, and the producer takes it again",
++		    text);
++		rever_game_depth::TestReset(); // the in-process layer's checks below start from nothing
++		DrawDepth(gpu, target, layout, a); // frame A's scene again
++	}
++
++	// --- frame A: the first (a cut: zero motion) ----------------------------------------------------------------------
++	LayerReader layer; // the layer in Alyx's own process: the game's device
++	layer.device1 = gpu.device1;
++	layer.ctx = gpu.ctx;
++	Check(layer.Take(0, layout.width, layout.height, 2, nullptr, nullptr) == kNoBlock, "before the first frame there is no block");
++	bool ok0 = rever_game_depth::ProduceEye(0, Input(target, layout, a[0], 0, now));
++	bool ok1 = rever_game_depth::ProduceEye(1, Input(target, layout, a[1], 1, now));
++	Check(ok0 && ok1, "frame A produced for both eyes");
++	{
++		HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, kBlockName);
++		const SrInputsBlock* b = m ? static_cast<const SrInputsBlock*>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(SrInputsBlock))) : nullptr;
++		snprintf(text, sizeof(text), "magic %08x version %u pid %u (self %lu) %ux%u (eye rect %dx%d) flags %u generation %ld seq %ld/%ld phase %u/%u",
++		    b ? b->magic : 0, b ? b->version : 0, b ? b->pid : 0, GetCurrentProcessId(), b ? b->width : 0, b ? b->height : 0,
++		    layout.width, layout.height, b ? b->flags : 0, b ? b->generation : 0, b ? b->eyes[0].seq : 0, b ? b->eyes[1].seq : 0,
++		    b ? b->eyes[0].phase : 9, b ? b->eyes[1].phase : 9);
++		Check(b && b->magic == kSrInputsMagic && b->version == 1 && b->pid == GetCurrentProcessId() && b->width == uint32_t(layout.width)
++		        && b->height == uint32_t(layout.height) && b->flags == 1 && b->generation >= 1 && b->eyes[0].seq == 1
++		        && b->eyes[1].seq == 1 && b->eyes[0].phase == 0 && b->eyes[1].phase == 0,
++		    "the block as rever_xr_nr reads it", text);
++		if (b)
++			UnmapViewOfFile(b);
++		if (m)
++			CloseHandle(m);
++	}
++	Check(layer.Take(0, layout.width + 1, layout.height, 2, nullptr, nullptr) == kSizeRefused,
++	    "another eye size is refused, as the layer refuses it");
++	std::vector<float> depth, motion;
++	for (int e = 0; e < 2; ++e) {
++		const TakeResult r = layer.Take(uint32_t(e), layout.width, layout.height, 2, &depth, &motion);
++		float P[4][4];
++		Projection(a[e], P);
++		const Expected x = Reproject(a[e], a[e], P, layout.width, layout.height, false);
++		const Compare c = CompareEye(x, depth, motion, true);
++		snprintf(text, sizeof(text), "eye %d: taken %d, inverted %d, depth max rel err %.2e, motion max %.4f px over %llu px, sky %llu px "
++		    "(non-zero depth %llu), bad %llu",
++		    e, int(r == kTaken), int(layer.inverted), c.depthMaxRel, c.motionMax, (unsigned long long)c.compared,
++		    (unsigned long long)c.skyPixels, (unsigned long long)c.skyNonZeroDepth, (unsigned long long)c.bad);
++		Check(r == kTaken && layer.inverted && c.compared > 100000 && c.bad == 0 && c.skyPixels > 1000 && c.skyNonZeroDepth == 0
++		        && MaxAbs(motion) == 0.0,
++		    "frame A (the first: a cut): the inverted depth matches the scene, the sky is 0, the motion is zero", text);
++	}
++	Check(layer.Take(0, layout.width, layout.height, 2, nullptr, nullptr) == kNothingNew, "the same frame is not taken twice (seq)");
++
++	// --- frame B: a head turn over a static scene --------------------------------------------------------------------
++	// the game's own compute / output-merger state, to be given back as it was (and its depth bound for writing)
++	ID3DBlob* dummyCode = Compile("RWTexture2D<float> o : register(u0); [numthreads(1,1,1)] void CS(uint3 i : SV_DispatchThreadID) { o[i.xy] = 1; }",
++	    "CS", "cs_5_0");
++	ID3D11ComputeShader* gameCs = nullptr;
++	gpu.device->CreateComputeShader(dummyCode->GetBufferPointer(), dummyCode->GetBufferSize(), nullptr, &gameCs);
++	dummyCode->Release();
++	D3D11_TEXTURE2D_DESC gd{};
++	gd.Width = gd.Height = 16;
++	gd.MipLevels = gd.ArraySize = 1;
++	gd.Format = DXGI_FORMAT_R32_FLOAT;
++	gd.SampleDesc.Count = 1;
++	gd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++	ID3D11Texture2D* gameTex = nullptr;
++	ID3D11Texture2D* gameTex2 = nullptr;
++	gpu.device->CreateTexture2D(&gd, nullptr, &gameTex);
++	gpu.device->CreateTexture2D(&gd, nullptr, &gameTex2);
++	ID3D11ShaderResourceView* gameSrv = nullptr;
++	ID3D11UnorderedAccessView* gameUav = nullptr;
++	gpu.device->CreateShaderResourceView(gameTex, nullptr, &gameSrv);
++	gpu.device->CreateUnorderedAccessView(gameTex2, nullptr, &gameUav);
++	gd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++	gd.Width = layout.texW;
++	gd.Height = layout.texH;
++	gd.BindFlags = D3D11_BIND_RENDER_TARGET;
++	ID3D11Texture2D* gameColour = nullptr;
++	ID3D11RenderTargetView* gameRtv = nullptr;
++	gpu.device->CreateTexture2D(&gd, nullptr, &gameColour);
++	gpu.device->CreateRenderTargetView(gameColour, nullptr, &gameRtv);
++
++	Head headB{ {}, { 0.13, -0.01, 0.18 } };
++	QuatFromYawPitch(4.0, -1.5, headB.q);
++	Eye b[2] = { MakeEye(0, headB), MakeEye(1, headB) };
++	DrawDepth(gpu, target, layout, b);
++	now += 11;
++	gpu.ctx->CSSetShader(gameCs, nullptr, 0);
++	gpu.ctx->CSSetShaderResources(0, 1, &gameSrv);
++	gpu.ctx->CSSetUnorderedAccessViews(0, 1, &gameUav, nullptr);
++	gpu.ctx->CSSetConstantBuffers(0, 1, &gpu.cb);
++	gpu.ctx->OMSetRenderTargets(1, &gameRtv, target.dsv); // the game's depth still bound for writing at its submit
++	ok0 = rever_game_depth::ProduceEye(0, Input(target, layout, b[0], 0, now));
++	{
++		ID3D11ComputeShader* cs = nullptr;
++		ID3D11ShaderResourceView* srv = nullptr;
++		ID3D11UnorderedAccessView* uav = nullptr;
++		ID3D11Buffer* cb = nullptr;
++		ID3D11RenderTargetView* rtv = nullptr;
++		ID3D11DepthStencilView* dsv = nullptr;
++		gpu.ctx->CSGetShader(&cs, nullptr, nullptr);
++		gpu.ctx->CSGetShaderResources(0, 1, &srv);
++		gpu.ctx->CSGetUnorderedAccessViews(0, 1, &uav);
++		gpu.ctx->CSGetConstantBuffers(0, 1, &cb);
++		gpu.ctx->OMGetRenderTargets(1, &rtv, &dsv);
++		Check(cs == gameCs && srv == gameSrv && uav == gameUav && cb == gpu.cb && rtv == gameRtv && dsv == target.dsv,
++		    "the game's compute shader, views, constant buffer and render / depth targets given back as they were");
++		SafeRelease(cs);
++		SafeRelease(srv);
++		SafeRelease(uav);
++		SafeRelease(cb);
++		SafeRelease(rtv);
++		SafeRelease(dsv);
++	}
++	gpu.ctx->OMSetRenderTargets(0, nullptr, nullptr);
++	ID3D11ShaderResourceView* noSrv = nullptr;
++	ID3D11UnorderedAccessView* noUav = nullptr;
++	gpu.ctx->CSSetShaderResources(0, 1, &noSrv);
++	gpu.ctx->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
++	gpu.ctx->CSSetShader(nullptr, nullptr, 0);
++	ok1 = rever_game_depth::ProduceEye(1, Input(target, layout, b[1], 1, now));
++	Check(ok0 && ok1, "frame B produced for both eyes");
++	for (int e = 0; e < 2; ++e) {
++		const TakeResult r = layer.Take(uint32_t(e), layout.width, layout.height, 2, &depth, &motion);
++		float Pa[4][4];
++		Projection(a[e], Pa);
++		const Expected x = Reproject(b[e], a[e], Pa, layout.width, layout.height, true);
++		const Compare c = CompareEye(x, depth, motion, false);
++		snprintf(text, sizeof(text), "eye %d: taken %d, motion max err %.4f px, mean err %.4f px (mean motion %.2f px) over %llu px, "
++		    "sky motion max err %.4f px, depth max rel err %.2e, bad %llu",
++		    e, int(r == kTaken), c.motionMax, c.motionMean, MeanAbsMotion(x.motion), (unsigned long long)c.compared, c.skyMotionMax,
++		    c.depthMaxRel, (unsigned long long)c.bad);
++		Check(r == kTaken && c.compared > 100000 && c.bad == 0 && MeanAbsMotion(x.motion) > 5.0,
++		    "frame B (a head turn, a static scene): the vectors match the CPU's reprojection, the sky its rotation", text);
++	}
++
++	// --- cuts: OpenVR's discontinuity, a pose jump, a gap ------------------------------------------------------------
++	const auto zeroMotionFrame = [&](const char* what, const Eye eyes[2], uint64_t at, uint32_t flags) {
++		const uint64_t resetsBefore = rever_game_depth::CurrentStats().resets;
++		const bool p0 = rever_game_depth::ProduceEye(0, Input(target, layout, eyes[0], 0, at, flags));
++		const bool p1 = rever_game_depth::ProduceEye(1, Input(target, layout, eyes[1], 1, at, flags));
++		double worst = 0;
++		bool taken = true;
++		for (int e = 0; e < 2; ++e) {
++			taken = layer.Take(uint32_t(e), layout.width, layout.height, 2, &depth, &motion) == kTaken && taken;
++			worst = MaxAbs(motion) > worst ? MaxAbs(motion) : worst;
++		}
++		const uint64_t resets = rever_game_depth::CurrentStats().resets - resetsBefore;
++		snprintf(text, sizeof(text), "produced %d/%d, taken %d, max |motion| %.4f, resets +%llu", int(p0), int(p1), int(taken), worst,
++		    (unsigned long long)resets);
++		Check(p0 && p1 && taken && worst == 0.0 && resets == 2, what, text);
++	};
++	Head headC = headB;
++	QuatFromYawPitch(6.0, -1.0, headC.q);
++	Eye c[2] = { MakeEye(0, headC), MakeEye(1, headC) };
++	DrawDepth(gpu, target, layout, c);
++	now += 11;
++	zeroMotionFrame("a discontinuity (flag 0x20) is a cut: zero motion", c, now, 0x238);
++	Head headD = headC;
++	headD.position[0] += 1.0; // a metre in one frame: a recentre, tracking lost
++	Eye dEyes[2] = { MakeEye(0, headD), MakeEye(1, headD) };
++	DrawDepth(gpu, target, layout, dEyes);
++	now += 11;
++	zeroMotionFrame("a pose jump is a cut: zero motion", dEyes, now, 0x218);
++	now += 400;
++	zeroMotionFrame("a gap of 400 ms is a cut: zero motion", dEyes, now, 0x218);
++	{ // and the next ordinary frame moves again
++		Head headE = headD;
++		QuatFromYawPitch(8.0, -1.0, headE.q);
++		Eye e2[2] = { MakeEye(0, headE), MakeEye(1, headE) };
++		DrawDepth(gpu, target, layout, e2);
++		now += 11;
++		rever_game_depth::ProduceEye(0, Input(target, layout, e2[0], 0, now));
++		layer.Take(0, layout.width, layout.height, 2, &depth, &motion);
++		float Pd[4][4];
++		Projection(dEyes[0], Pd);
++		const Compare cmp = CompareEye(Reproject(e2[0], dEyes[0], Pd, layout.width, layout.height, true), depth, motion, false);
++		snprintf(text, sizeof(text), "motion max err %.4f px, bad %llu", cmp.motionMax, (unsigned long long)cmp.bad);
++		Check(cmp.bad == 0 && MaxAbs(motion) > 1.0, "after a cut the next frame has its motion again", text);
++		rever_game_depth::ProduceEye(1, Input(target, layout, e2[1], 1, now));
++		layer.Take(1, layout.width, layout.height, 2, nullptr, nullptr);
++		std::memcpy(dEyes, e2, sizeof(e2));
++	}
++
++	// --- a busy key: the frame skipped, never waited for --------------------------------------------------------------
++	{
++		now += 11;
++		rever_game_depth::ProduceEye(0, Input(target, layout, dEyes[0], 0, now)); // written, key 1
++		// the reader takes key 1 and holds it (as the layer does while DLSS reads it)
++		const LONG seqBefore = layer.block->eyes[0].seq;
++		const bool held = layer.depthMutex[0]->AcquireSync(1, 100) == S_OK;
++		const uint64_t busyBefore = rever_game_depth::CurrentStats().busy;
++		LARGE_INTEGER f, t0, t1;
++		QueryPerformanceFrequency(&f);
++		QueryPerformanceCounter(&t0);
++		now += 11;
++		const bool produced = rever_game_depth::ProduceEye(0, Input(target, layout, dEyes[0], 0, now));
++		QueryPerformanceCounter(&t1);
++		const double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(f.QuadPart);
++		const bool sameSeq = layer.block->eyes[0].seq == seqBefore;
++		if (held)
++			layer.depthMutex[0]->ReleaseSync(0);
++		snprintf(text, sizeof(text), "held %d, produced %d, busy +%llu, seq unchanged %d, the call took %.3f ms", int(held), int(produced),
++		    (unsigned long long)(rever_game_depth::CurrentStats().busy - busyBefore), int(sameSeq), ms);
++		Check(held && !produced && sameSeq && rever_game_depth::CurrentStats().busy == busyBefore + 1 && ms < 5.0,
++		    "a key the reader holds skips the frame at once", text);
++		now += 11;
++		Check(rever_game_depth::ProduceEye(0, Input(target, layout, dEyes[0], 0, now)), "given back, the next frame is produced");
++		layer.Take(0, layout.width, layout.height, 2, nullptr, nullptr);
++	}
++
++	// --- the eyes' sizes differ by a pixel: eye 1 goes without (the block holds one size) ----------------------------
++	{
++		EyeInput odd = Input(target, layout, dEyes[1], 1, now);
++		odd.width -= 1;
++		const uint64_t before = rever_game_depth::CurrentStats().sizeSkips;
++		Check(!rever_game_depth::ProduceEye(1, odd) && rever_game_depth::CurrentStats().sizeSkips == before + 1,
++		    "eye 1 of another size than eye 0 is skipped");
++	}
++
++	// --- a new size (the game's resolution changed): a new generation, the layer reopens, zero motion first ------------
++	{
++		const Layout reduced = MakeLayout(500, 1507, 753);
++		DrawDepth(gpu, target, reduced, dEyes);
++		const long genBefore = rever_game_depth::CurrentStats().generation;
++		now += 11;
++		const bool p0 = rever_game_depth::ProduceEye(0, Input(target, reduced, dEyes[0], 0, now));
++		const bool p1 = rever_game_depth::ProduceEye(1, Input(target, reduced, dEyes[1], 1, now));
++		const TakeResult r0 = layer.Take(0, reduced.width, reduced.height, 2, &depth, &motion);
++		const double m0 = MaxAbs(motion);
++		const TakeResult r1 = layer.Take(1, reduced.width, reduced.height, 2, nullptr, nullptr);
++		const rever_game_depth::Stats s = rever_game_depth::CurrentStats();
++		snprintf(text, sizeof(text), "generation %ld -> %ld, %ux%u (eye rect %dx%d), taken %d/%d, max |motion| %.4f", genBefore, s.generation,
++		    s.width, s.height, reduced.width, reduced.height, int(r0 == kTaken), int(r1 == kTaken), m0);
++		Check(p0 && p1 && s.generation == genBefore + 1 && s.width == uint32_t(reduced.width) && r0 == kTaken && r1 == kTaken && m0 == 0.0,
++		    "a new size: new textures (generation), the layer opens them, the first frame a cut", text);
++		Check(layer.Take(0, layout.width, layout.height, 2, nullptr, nullptr) == kSizeRefused, "the old size is refused afterwards");
++		DrawDepth(gpu, target, layout, dEyes);
++		now += 11;
++		rever_game_depth::ProduceEye(0, Input(target, layout, dEyes[0], 0, now));
++		rever_game_depth::ProduceEye(1, Input(target, layout, dEyes[1], 1, now));
++		layer.Take(0, layout.width, layout.height, 2, nullptr, nullptr);
++		layer.Take(1, layout.width, layout.height, 2, nullptr, nullptr);
++	}
++
++	// --- a multisampled depth (sample 0) -----------------------------------------------------------------------------
++	{
++		DepthTarget ms = MakeDepth(gpu, layout.texW, layout.texH, 4);
++		DrawDepth(gpu, ms, layout, dEyes);
++		now += 11;
++		const bool p = rever_game_depth::ProduceEye(0, Input(ms, layout, dEyes[0], 0, now));
++		const TakeResult r = layer.Take(0, layout.width, layout.height, 2, &depth, &motion);
++		float P[4][4];
++		Projection(dEyes[0], P);
++		const Compare cmp = CompareEye(Reproject(dEyes[0], dEyes[0], P, layout.width, layout.height, true), depth, motion, false);
++		snprintf(text, sizeof(text), "produced %d, taken %d, depth max rel err %.2e, motion max %.4f px (still head), bad %llu", int(p),
++		    int(r == kTaken), cmp.depthMaxRel, cmp.motionMax, (unsigned long long)cmp.bad);
++		Check(p && r == kTaken && cmp.bad == 0, "a 4x MSAA depth is read (its sample 0)", text);
++		rever_game_depth::ProduceEye(1, Input(ms, layout, dEyes[1], 1, now));
++		layer.Take(1, layout.width, layout.height, 2, nullptr, nullptr);
++		SafeRelease(ms.dsv);
++		SafeRelease(ms.texture);
++	}
++
++	// --- the per-second line ------------------------------------------------------------------------------------------
++	now += 1500;
++	rever_game_depth::ProduceEye(0, Input(target, layout, dEyes[0], 0, now));
++	Check(Logged("eyes produced") && Logged("resets"), "the per-second line (eyes produced, skipped, size, resets)");
++	Check(Logged("first handed to Rever's layer"), "the first eye's line (sizes, depth convention, tangents)");
++
++	const rever_game_depth::Stats s = rever_game_depth::CurrentStats();
++	std::printf("stats: produced %llu, busy %llu, size %llu, other %llu, resets %llu, %ux%u generation %ld, broken %d\n",
++	    (unsigned long long)s.produced, (unsigned long long)s.busy, (unsigned long long)s.sizeSkips, (unsigned long long)s.otherSkips,
++	    (unsigned long long)s.resets, s.width, s.height, s.generation, int(s.broken));
++	Check(!s.broken, "the producer never broke");
++
++	layer.Close();
++	rever_game_depth::TestReset();
++	SafeRelease(gameRtv);
++	SafeRelease(gameColour);
++	SafeRelease(gameSrv);
++	SafeRelease(gameUav);
++	SafeRelease(gameTex);
++	SafeRelease(gameTex2);
++	SafeRelease(gameCs);
++	SafeRelease(target.dsv);
++	SafeRelease(target.texture);
++	std::printf("%d checks, %d failed\n", g_checks, g_failures);
++	return g_failures ? 1 : 0;
++}
+diff --git a/DrvOpenXR/XrBackend.cpp b/DrvOpenXR/XrBackend.cpp
+index f5a8eea..c7bd31a 100644
+--- a/DrvOpenXR/XrBackend.cpp
++++ b/DrvOpenXR/XrBackend.cpp
+@@ -6,6 +6,10 @@
+ #include "XrGenericTracker.h"
+ #include "generated/interfaces/vrtypes.h"
+ 
++#if defined(_WIN32) && defined(SUPPORT_DX) && defined(SUPPORT_DX11)
++#include "ReverGameDepth.h" // Rever VR: Half-Life: Alyx's depth for Rever's layer
++#endif
++
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #include <Windows.h>
+@@ -466,8 +470,14 @@ void XrBackend::StoreEyeTexture(
+ 	Compositor& comp = *compPtr;
+ 
+ 	// If the session is inactive, we may be unable to write to the surface
+-	if (sessionActive && renderingFrame)
++	if (sessionActive && renderingFrame) {
++#if defined(_WIN32) && defined(SUPPORT_DX) && defined(SUPPORT_DX11)
++		// Rever VR: Alyx's depth and the camera's motion for Rever's layer (ReverGameDepth.h), before the copy below
++		// releases the eye's image (where the layer upscales it); nothing unless REVER_ALYX_GAME_DEPTH=1
++		ReverGameDepthSubmit((int)eye, texture, bounds, (uint32_t)submitFlags, layer.pose, layer.fov, comp);
++#endif
+ 		comp.Invoke(texture, bounds, layer.subImage, (XruEye)eye, submitFlags);
++	}
+ 
+ 	submittedEyeTextures = true;
+ 
